@@ -381,16 +381,53 @@ Cooldown
 # ==========================================
 # 4. Streamlit UI 構築
 # ==========================================
+# ==========================================
+# 4. Streamlit UI 構築
+# ==========================================
+import base64
+import streamlit.components.v1 as components
+
 icon_setting = "🚴‍♂️"
 for fname in ["icon.png", "icon.jpg", "icon.jpeg", "icon.png.jpg", "icon.png.jpeg"]:
     if os.path.exists(fname):
         icon_setting = fname
         break
+
 st.set_page_config(
     page_title="AI Cycling Coach",
     page_icon=icon_setting,
     layout="wide",
     initial_sidebar_state="collapsed"
+)
+
+# スマホのホーム画面用アイコン(apple-touch-icon)を強制的に上書き
+if icon_setting != "🚴‍♂️":
+    with open(icon_setting, "rb") as f:
+        b64_icon = base64.b64encode(f.read()).decode()
+    mime_type = "image/png" if icon_setting.endswith(".png") else "image/jpeg"
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const dataUrl = "data:{mime_type};base64,{b64_icon}";
+            const fav = window.parent.document.querySelector("link[rel*='icon']");
+            const iconUrl = (fav && fav.href) ? fav.href : dataUrl;
+            [window.parent.document, window.top.document].forEach(doc => {{
+                try {{
+                    doc.querySelectorAll("link[rel*='apple-touch-icon'], link[rel='manifest']").forEach(e => e.remove());
+                    ["apple-touch-icon", "apple-touch-icon-precomposed"].forEach(rel => {{
+                        const link = doc.createElement("link");
+                        link.rel = rel;
+                        link.href = iconUrl;
+                        doc.head.appendChild(link);
+                    }});
+                }} catch (e) {{}}
+            }});
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 )
 
 st.markdown("""
