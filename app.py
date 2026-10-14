@@ -419,8 +419,8 @@ def sync_intervals_now(show_msg=True):
         with st.spinner("Intervals.icuから最新データ＆パワーカーブを取得中..."):
             save_config(current_cfg_dict) # 同期時に設定も自動保存
             client = IntervalsClient(athlete_id, intervals_key)
-            wellness = client.get_wellness(days=14)
-            activities = client.get_activities(days=14)
+            wellness = client.get_wellness(days=30)
+            activities = client.get_activities(days=30)
             pdc_raw = client.get_power_curves(curves="42d")
             st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, weight, ftp)
         if show_msg:
