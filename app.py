@@ -94,7 +94,7 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
-    def get_power_curves(self, curves: str = "42d") -> dict:
+    def get_power_curves(self, curves: str = "all") -> dict:
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/power-curves.json"
         res = requests.get(url, auth=self.auth, params={"curves": curves, "type": "Ride"}, timeout=10)
         res.raise_for_status()
@@ -282,7 +282,7 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
             p = metrics["pdc"]
             w, wkg = p["watts"], p["wkg"]
             pdc_summary = (
-                f"- 直近42日ベスト: 15秒={w['15s']}W({wkg['15s']}W/kg), 1分={w['1m']}W({wkg['1m']}W/kg), "
+                f"- 全期間ベスト: 15秒={w['15s']}W({wkg['15s']}W/kg), 1分={w['1m']}W({wkg['1m']}W/kg), "
                 f"5分={w['5m']}W({wkg['5m']}W/kg), 20分={w['20m']}W({wkg['20m']}W/kg), 60分={w['60m']}W({wkg['60m']}W/kg)\n"
                 f"- 推定eFTP: {p['eftp'] or '未算出'} W / 診断: {p['diagnosis']}"
             )
@@ -421,7 +421,7 @@ def sync_intervals_now(show_msg=True):
             client = IntervalsClient(athlete_id, intervals_key)
             wellness = client.get_wellness(days=30)
             activities = client.get_activities(days=30)
-            pdc_raw = client.get_power_curves(curves="42d")
+            pdc_raw = client.get_power_curves(curves="all")
             st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, weight, ftp)
         if show_msg:
             st.toast("✅ Intervals.icu 同期完了！")
@@ -456,7 +456,7 @@ else:
 
 if st.session_state.metrics and "pdc" in st.session_state.metrics:
     pdc = st.session_state.metrics["pdc"]
-    with st.expander("📈 直近42日のパワーカーブ (PDC) & 弱点プロファイリング", expanded=False):
+    with st.expander("📈 全期間のパワーカーブ (PDC) & 弱点プロファイリング", expanded=False):
         st.info(pdc["diagnosis"])
         pc1, pc2, pc3, pc4, pc5 = st.columns(5)
         pc1.metric("15秒", f"{pdc['watts']['15s']} W", f"{pdc['wkg']['15s']} W/kg")
