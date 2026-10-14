@@ -31,7 +31,6 @@ DEFAULT_CONFIG = {
 
 def load_config() -> dict:
     config = DEFAULT_CONFIG.copy()
-    # 1. ローカルの config.json から読み込み
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -39,7 +38,6 @@ def load_config() -> dict:
                 config.update(saved)
         except Exception:
             pass
-    # 2. スマホ/クラウド(Streamlit Secrets)が設定されていれば優先補完
     try:
         for k in ["athlete_id", "intervals_key", "gemini_key"]:
             if not config.get(k) and k in st.secrets:
@@ -52,12 +50,12 @@ def save_config(new_config: dict):
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(new_config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.warning(f"設定ファイルの保存に失敗しました（クラウド環境の場合は正常です）: {e}")
+    except Exception:
+        pass
 
 
 # ==========================================
-# 1. 週間プラン用の構造化データスキーマ (JSON出力用)
+# 1. 週間プラン用の構造化データスキーマ
 # ==========================================
 class DailyWorkoutItem(BaseModel):
     date: str = Field(description="日付 (YYYY-MM-DD)")
@@ -86,7 +84,7 @@ class IntervalsClient:
         self.athlete_id = athlete_id.strip()
         self.auth = ("API_KEY", api_key.strip())
 
-    def get_wellness(self, days: int = 14) -> list:
+    def get_wellness(self, days: int = 30) -> list:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/wellness"
@@ -94,7 +92,7 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
-    def get_activities(self, days: int = 14) -> list:
+    def get_activities(self, days: int = 30) -> list:
         end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/activities"
@@ -102,8 +100,14 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
+    def get_activity_detail(self, activity_id: str) -> dict:
+        """個別ライドのインターバル(ラップ)詳細・ゾーン滞在時間を取得"""
+        url = f"{self.BASE_URL}/activity/{activity_id}"
+        res = requests.get(url, auth=self.auth, params={"intervals": "true"}, timeout=10)
+        res.raise_for_status()
+        return res.json()
+
     def get_power_curves(self, curves: str = "42d") -> dict:
-        """直近(デフォルト42日間)のパワーデュレーションカーブを取得"""
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/power-curves.json"
         res = requests.get(url, auth=self.auth, params={"curves": curves, "type": "Ride"}, timeout=10)
         res.raise_for_status()
@@ -127,7 +131,6 @@ class IntervalsClient:
 # 3. データ解析 & パワーカーブ弱点診断ロジック
 # ==========================================
 def extract_pdc_metrics(pdc_raw: dict, weight: float, current_ftp: int) -> dict:
-    """power-curves.jsonから15秒/1分/5分/20分/60分パワーと弱点診断を生成"""
     target_durations = {"15s": 15, "1m": 60, "5m": 300, "20m": 1200, "60m": 3600}
     extracted = {k: 0 for k in target_durations}
     eftp = None
@@ -144,7 +147,6 @@ def extract_pdc_metrics(pdc_raw: dict, weight: float, current_ftp: int) -> dict:
                 if target_sec in sec_to_watt:
                     extracted[label] = int(sec_to_watt[target_sec] or 0)
                 elif secs:
-                    # 最も近い秒数を参照
                     closest_sec = min(secs, key=lambda x: abs(x - target_sec))
                     if abs(closest_sec - target_sec) <= 30:
                         extracted[label] = int(sec_to_watt.get(closest_sec, 0) or 0)
@@ -155,10 +157,8 @@ def extract_pdc_metrics(pdc_raw: dict, weight: float, current_ftp: int) -> dict:
     except Exception:
         pass
 
-    # 弱点プロファイリング計算
     w_5m = extracted["5m"]
     w_20m = extracted["20m"]
-    w_1m = extracted["1m"]
     diagnosis = "パワーカーブデータ未取得（ライド履歴が増えると自動診断されます）"
 
     if w_5m > 0 and w_20m > 0:
@@ -200,23 +200,68 @@ def parse_intervals_data(wellness_raw: list, activities_raw: list, pdc_raw: dict
         latest_tsb = round(latest_ctl - latest_atl, 1)
         latest_weight = latest.get("weight")
 
+    # 新しい日付順（降順）にソート
+    sorted_acts = sorted(
+        activities_raw,
+        key=lambda x: x.get("start_date_local", ""),
+        reverse=True
+    )
+
     act_list = []
+    raw_rides = []
     eftp_from_act = None
-    for act in activities_raw:
+
+    for act in sorted_acts:
         if not act.get("type") or "Ride" not in act.get("type", ""):
             continue
-        if act.get("icu_pm_ftp"):
+        if not eftp_from_act and act.get("icu_pm_ftp"):
             eftp_from_act = act.get("icu_pm_ftp")
+
         moving_time_min = round((act.get("moving_time") or 0) / 60)
+        dist_km = round((act.get("distance") or 0) / 1000, 1)
+        elev_m = round(act.get("total_elevation_gain") or 0)
+        np_w = round(act.get("icu_weighted_avg_watts") or 0)
+        avg_w = round(act.get("average_watts") or 0)
+        vi = round(np_w / avg_w, 2) if avg_w > 0 else 1.0
+        decoupling = round(act.get("decoupling") or 0.0, 1) if act.get("decoupling") is not None else None
+        ef = round(act.get("icu_efficiency_factor") or 0.0, 2) if act.get("icu_efficiency_factor") else None
+
         act_list.append({
             "日付": act.get("start_date_local", "")[:10],
             "ワークアウト名": act.get("name", "Ride"),
             "時間(分)": moving_time_min,
+            "距離(km)": dist_km,
+            "獲得標高(m)": elev_m,
             "TSS": round(act.get("icu_training_load") or 0),
-            "NP(W)": round(act.get("icu_weighted_avg_watts") or 0),
-            "平均(W)": round(act.get("average_watts") or 0),
+            "NP(W)": np_w,
+            "平均(W)": avg_w,
             "IF": round((act.get("icu_intensity") or 0) / 100, 2) if act.get("icu_intensity") else 0.0,
             "心拍(bpm)": round(act.get("average_heartrate") or 0),
+            "ケイデンス": round(act.get("average_cadence") or 0),
+            "デカップリング(%)": decoupling if decoupling is not None else "-",
+        })
+
+        raw_rides.append({
+            "id": act.get("id"),
+            "date": act.get("start_date_local", "")[:10],
+            "name": act.get("name", "Ride"),
+            "duration_min": moving_time_min,
+            "distance_km": dist_km,
+            "elevation_m": elev_m,
+            "tss": round(act.get("icu_training_load") or 0),
+            "np": np_w,
+            "avg_w": avg_w,
+            "max_w": round(act.get("max_watts") or 0),
+            "if": round((act.get("icu_intensity") or 0) / 100, 2) if act.get("icu_intensity") else 0.0,
+            "vi": vi,
+            "avg_hr": round(act.get("average_heartrate") or 0),
+            "max_hr": round(act.get("max_heartrate") or 0),
+            "cadence": round(act.get("average_cadence") or 0),
+            "decoupling": decoupling,
+            "ef": ef,
+            "zone_times": act.get("icu_zone_times"),
+            "feel": act.get("feel"),
+            "rpe": act.get("icu_rpe"),
         })
 
     pdc_info = extract_pdc_metrics(pdc_raw, weight, ftp)
@@ -229,8 +274,34 @@ def parse_intervals_data(wellness_raw: list, activities_raw: list, pdc_raw: dict
         "tsb": latest_tsb,
         "weight": latest_weight,
         "activities_df": pd.DataFrame(act_list),
+        "raw_rides": raw_rides,
         "pdc": pdc_info
     }
+
+
+def parse_activity_intervals(detail_json: dict, ftp: int) -> pd.DataFrame:
+    """個別アクティビティのラップ(インターバル)一覧をDataFrame化"""
+    intervals = detail_json.get("icu_intervals") or []
+    rows = []
+    for idx, iv in enumerate(intervals, start=1):
+        dur_sec = iv.get("moving_time") or iv.get("elapsed_time") or 0
+        if dur_sec < 10:
+            continue
+        mins, secs = divmod(int(dur_sec), 60)
+        avg_w = round(iv.get("average_watts") or 0)
+        pct_ftp = round((avg_w / ftp) * 100) if ftp > 0 else 0
+        rows.append({
+            "#": idx,
+            "種別": iv.get("type", ""),
+            "ラベル": iv.get("label") or f"Lap {idx}",
+            "時間": f"{mins}:{secs:02d}",
+            "平均パワー(W)": avg_w,
+            "FTP比(%)": f"{pct_ftp}%",
+            "平均心拍(bpm)": round(iv.get("average_heartrate") or 0),
+            "最大心拍(bpm)": round(iv.get("max_heartrate") or 0),
+            "ケイデンス(rpm)": round(iv.get("average_cadence") or 0),
+        })
+    return pd.DataFrame(rows)
 
 
 def determine_training_phase(days_left: int) -> str:
@@ -258,7 +329,7 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
     if metrics:
         ctl, atl, tsb = metrics["ctl"], metrics["atl"], metrics["tsb"]
         if not metrics["activities_df"].empty:
-            act_summary = metrics["activities_df"].to_markdown(index=False)
+            act_summary = metrics["activities_df"].head(15).to_markdown(index=False)
         if "pdc" in metrics:
             p = metrics["pdc"]
             w = p["watts"]
@@ -293,7 +364,7 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
 【パワーデュレーションカーブ (PDC / MMP) & 弱点診断】
 {pdc_summary}
 
-【直近14日間のライド履歴】
+【直近のライド履歴（最新順）】
 {act_summary}
 
 【Intervals.icu ワークアウト記法の書式ルール】
@@ -308,26 +379,25 @@ Cooldown
 
 
 # ==========================================
-# 4. Streamlit UI 構築 (スマホ対応レイアウト)
+# 4. Streamlit UI 構築
 # ==========================================
+icon_setting = "icon.png" if os.path.exists("icon.png") else "🚴‍♂️"
 st.set_page_config(
     page_title="AI Cycling Coach",
-    page_icon="icon.png",
+    page_icon=icon_setting,
     layout="wide",
-    initial_sidebar_state="collapsed" # スマホで開いたときにメイン画面を広く表示
+    initial_sidebar_state="collapsed"
 )
 
-# スマホで見やすくするためのカスタムCSS
 st.markdown("""
 <style>
     .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-    div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+    div[data-testid="stMetricValue"] { font-size: 1.35rem; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🚴‍♂️ AI Cycling Coach")
 
-# 保存済み設定のロード
 cfg = load_config()
 
 if "metrics" not in st.session_state:
@@ -338,12 +408,14 @@ if "generated_workout" not in st.session_state:
     st.session_state.generated_workout = None
 if "weekly_plan" not in st.session_state:
     st.session_state.weekly_plan = None
+if "activity_reviews" not in st.session_state:
+    st.session_state.activity_reviews = {}
+if "activity_details_cache" not in st.session_state:
+    st.session_state.activity_details_cache = {}
 
 # --- サイドバー：設定入力 ＆ 自動保存 ---
 with st.sidebar:
     st.header("⚙️ 設定 & 自動保存")
-    st.caption("一度保存すれば次回から入力不要です。")
-
     athlete_id = st.text_input("Intervals Athlete ID", value=cfg["athlete_id"], placeholder="例: i123456")
     intervals_key = st.text_input("Intervals API Key", value=cfg["intervals_key"], type="password")
     gemini_key = st.text_input("Gemini API Key", value=cfg["gemini_key"], type="password")
@@ -395,7 +467,7 @@ with st.sidebar:
 
     if st.button("💾 設定を保存する", use_container_width=True):
         save_config(current_cfg_dict)
-        st.success("設定を config.json に保存しました！")
+        st.success("設定を保存しました！")
 
 profile_data = {
     "ftp": ftp,
@@ -409,30 +481,29 @@ profile_data = {
     "weekend_hours": weekend_hours,
 }
 
-# --- データ同期関数（起動時の自動同期にも対応） ---
+# --- データ同期関数 ---
 def sync_intervals_now(show_msg=True):
     if not athlete_id or not intervals_key:
         if show_msg:
-            st.warning("左上の「＞」からサイドバーを開き、Athlete IDとAPI Keyを入力・保存してください。")
+            st.warning("左上の「＞」からサイドバーを開き、Athlete IDとAPI Keyを入力してください。")
         return
     try:
         with st.spinner("Intervals.icuから最新データ＆パワーカーブを取得中..."):
-            save_config(current_cfg_dict) # 同期時に設定も自動保存
+            save_config(current_cfg_dict)
             client = IntervalsClient(athlete_id, intervals_key)
             wellness = client.get_wellness(days=30)
             activities = client.get_activities(days=30)
             pdc_raw = client.get_power_curves(curves="42d")
             st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, weight, ftp)
         if show_msg:
-            st.toast("✅ Intervals.icu 同期＆パワーカーブ解析完了！")
+            st.toast("✅ Intervals.icu 同期完了！")
     except Exception as e:
         st.error(f"同期エラー: {e}")
 
-# 初回起動時、キーが保存されていれば自動でIntervals.icuと同期する
 if st.session_state.metrics is None and athlete_id and intervals_key:
     sync_intervals_now(show_msg=False)
 
-# --- メイン画面上部：ワンタップ同期ボタン & コンディション指標 ---
+# --- メイン画面上部：ダッシュボード指標 ---
 top_col1, top_col2 = st.columns([3, 1])
 with top_col1:
     days_to_race = (race_date - datetime.now().date()).days
@@ -457,28 +528,120 @@ else:
     m3.metric("ATL", "--")
     m4.metric("TSB", "--")
 
-# パワーカーブ弱点診断バナーの表示
 if st.session_state.metrics and "pdc" in st.session_state.metrics:
     pdc = st.session_state.metrics["pdc"]
-    with st.expander("📈 直近42日のパワーカーブ (PDC) & AI弱点プロファイリング結果", expanded=True):
+    with st.expander("📈 直近42日のパワーカーブ (PDC) & 弱点プロファイリング", expanded=False):
         st.info(pdc["diagnosis"])
         pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-        pc1.metric("15秒 (Sprint)", f"{pdc['watts']['15s']} W", f"{pdc['wkg']['15s']} W/kg")
-        pc2.metric("1分 (Anaerobic)", f"{pdc['watts']['1m']} W", f"{pdc['wkg']['1m']} W/kg")
-        pc3.metric("5分 (VO2max)", f"{pdc['watts']['5m']} W", f"{pdc['wkg']['5m']} W/kg")
-        pc4.metric("20分 (Threshold)", f"{pdc['watts']['20m']} W", f"{pdc['wkg']['20m']} W/kg")
+        pc1.metric("15秒", f"{pdc['watts']['15s']} W", f"{pdc['wkg']['15s']} W/kg")
+        pc2.metric("1分", f"{pdc['watts']['1m']} W", f"{pdc['wkg']['1m']} W/kg")
+        pc3.metric("5分", f"{pdc['watts']['5m']} W", f"{pdc['wkg']['5m']} W/kg")
+        pc4.metric("20分", f"{pdc['watts']['20m']} W", f"{pdc['wkg']['20m']} W/kg")
         pc5.metric("60分 / eFTP", f"{pdc['watts']['60m']} W", f"eFTP: {pdc['eftp'] or '--'}W")
 
 # --- タブ構成 ---
-tab_daily, tab_weekly, tab_chat, tab_history = st.tabs([
-    "🎯 今日のメニュー",
+tab_review, tab_daily, tab_weekly, tab_chat = st.tabs([
+    "🔍 直近ライドAI評価",
+    "🎯 今日のメニュー生成",
     "📅 週間プラン一括生成",
-    "💬 AIコーチ相談",
-    "📊 ライド履歴"
+    "💬 AIコーチ相談"
 ])
 
 # ==========================================
-# Tab 1: 今日のAIワークアウト生成
+# Tab 1: 直近ライドAI評価（新機能！）
+# ==========================================
+with tab_review:
+    st.subheader("🔍 直近アクティビティのAI徹底評価 & ラップ解析")
+    if not st.session_state.metrics or not st.session_state.metrics.get("raw_rides"):
+        st.info("ライドデータがありません。右上の「🔄 最新データを再同期」を押してください。")
+    else:
+        rides = st.session_state.metrics["raw_rides"]
+        ride_options = [
+            f"{r['date']} | {r['name']} ({r['duration_min']}分 / TSS:{r['tss']} / NP:{r['np']}W)"
+            for r in rides
+        ]
+        selected_idx = st.selectbox("評価・分析するライドを選択（一番上が最新ライドです）", range(len(ride_options)), format_func=lambda i: ride_options[i])
+        target_ride = rides[selected_idx]
+        act_id = target_ride["id"]
+
+        # 選択したライドのサマリーメトリクス表示
+        r1, r2, r3, r4, r5, r6 = st.columns(6)
+        r1.metric("NP / 平均パワー", f"{target_ride['np']} W", f"平均 {target_ride['avg_w']} W")
+        r2.metric("IF / TSS", f"{target_ride['if']}", f"TSS: {target_ride['tss']}")
+        r3.metric("時間 / 距離", f"{target_ride['duration_min']} 分", f"{target_ride['distance_km']} km / 獲得{target_ride['elevation_m']}m")
+        r4.metric("平均 / 最大心拍", f"{target_ride['avg_hr']} bpm", f"Max {target_ride['max_hr']} bpm")
+        dec_val = f"{target_ride['decoupling']}%" if target_ride['decoupling'] is not None else "データなし"
+        dec_status = "優秀 (<5%)" if (target_ride['decoupling'] is not None and target_ride['decoupling'] < 5.0) else ("タレ注意 (>5%)" if target_ride['decoupling'] is not None else "")
+        r5.metric("心拍デカップリング", dec_val, dec_status)
+        r6.metric("ケイデンス / VI", f"{target_ride['cadence']} rpm", f"VI: {target_ride['vi']} / EF: {target_ride['ef'] or '--'}")
+
+        # 個別ライドの詳細(ラップ/インターバル)を取得
+        df_laps = pd.DataFrame()
+        if act_id and athlete_id and intervals_key:
+            if act_id not in st.session_state.activity_details_cache:
+                try:
+                    client = IntervalsClient(athlete_id, intervals_key)
+                    st.session_state.activity_details_cache[act_id] = client.get_activity_detail(act_id)
+                except Exception:
+                    st.session_state.activity_details_cache[act_id] = {}
+            detail_data = st.session_state.activity_details_cache.get(act_id, {})
+            if detail_data:
+                df_laps = parse_activity_intervals(detail_data, ftp)
+
+        if not df_laps.empty:
+            with st.expander("⏱️ インターバル / ラップ詳細データを表示", expanded=False):
+                st.dataframe(df_laps, use_container_width=True, hide_index=True)
+
+        user_comment = st.text_input("ライドの主観メモ（任意：脚の張り、補給、機材変更、きつかった場面など）", placeholder="例: 3本目から脚が重くなった、向かい風が強かった など")
+
+        if st.button("🤖 このライドをAIコーチに採点・評価してもらう", type="primary", use_container_width=True):
+            if not gemini_key:
+                st.error("サイドバーで Gemini API Key を設定・保存してください。")
+            else:
+                sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
+                laps_md = df_laps.to_markdown(index=False) if not df_laps.empty else "ラップ詳細なし（全体スタッツから評価してください）"
+                review_prompt = f"""
+以下の直近のアクティビティデータをプロコーチの視点で徹底評価してください。
+
+【評価対象アクティビティ】
+- 日付: {target_ride['date']}
+- タイトル: {target_ride['name']}
+- 移動時間: {target_ride['duration_min']}分 / 距離: {target_ride['distance_km']}km / 獲得標高: {target_ride['elevation_m']}m
+- NP: {target_ride['np']}W (現在FTP {ftp}W に対して IF {target_ride['if']}) / 平均パワー: {target_ride['avg_w']}W / 最大パワー: {target_ride['max_w']}W
+- TSS: {target_ride['tss']} / VI (変動指数): {target_ride['vi']} / EF (効率指数): {target_ride['ef']}
+- 平均心拍: {target_ride['avg_hr']}bpm / 最大心拍: {target_ride['max_hr']}bpm / 平均ケイデンス: {target_ride['cadence']}rpm
+- パワー心拍デカップリング (Pw:Hr): {dec_val}
+- アスリート本人の主観メモ: {user_comment or '特になし'}
+
+【インターバル / ラップ推移データ】
+{laps_md}
+
+【出力フォーマット】
+1. 🏆 **総合評価スコア（100点満点 & S/A/B/C判定）と総評**: このライドが現在のフェーズおよび目標レース（{race_name}）に向けてどのような効果があったか。
+2. 📊 **ペーシング・ラップ推移・心拍デカップリングの深掘り分析**:
+   - インターバルの各本数の維持具合、VI（ペーシングの一定さ）、ケイデンス、および心拍デカップリング（後半の有酸素タレ具合）から読み取れる具体的な強みと課題。
+3. 💡 **次回に向けた改善アクション & 疲労ケア**:
+   - 現在のTSB（{st.session_state.metrics['tsb']}）も踏まえ、明日・明後日にどう過ごすべきか、次回の同系統メニューでは何W・何分を狙うべきか具体的に提案してください。
+"""
+                with st.spinner("AIコーチがラップ推移と心拍・パワーデータを精密解析中..."):
+                    client_ai = genai.Client(api_key=gemini_key)
+                    response = client_ai.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=review_prompt,
+                        config=types.GenerateContentConfig(system_instruction=sys_prompt)
+                    )
+                    st.session_state.activity_reviews[act_id] = response.text
+
+        if act_id in st.session_state.activity_reviews:
+            st.divider()
+            st.markdown(st.session_state.activity_reviews[act_id])
+
+        st.divider()
+        with st.expander("📋 過去30日間のライド一覧表を見る", expanded=False):
+            st.dataframe(st.session_state.metrics["activities_df"], use_container_width=True, hide_index=True)
+
+# ==========================================
+# Tab 2: 今日のAIワークアウト生成
 # ==========================================
 with tab_daily:
     col_opt1, col_opt2, col_opt3 = st.columns(3)
@@ -498,7 +661,7 @@ with tab_daily:
 以下の条件で、本日実施すべき最適なワークアウトを1つ作成してください。
 - 使用可能時間: {avail_minutes} 分 / 環境: {indoor_mode} / 体調: {rpe_feeling}
 【出力構成】
-1. 今日のメニューの狙い（現在のTSB、パワーカーブの弱点診断、目標レースまでの残り日数を踏まえた理由）
+1. 今日のメニューの狙い（現在のTSB、直近ライドの疲労、パワーカーブの弱点診断、目標レースまでの残り日数を踏まえた理由）
 2. メニュー詳細（各セクションの目標ワット数 `{ftp}W` 基準の実数値とケイデンス）
 3. Intervals.icu カレンダー登録用のワークアウトコードブロック（必ず ```workout から始めて記述すること）
 """
@@ -532,12 +695,10 @@ with tab_daily:
                     st.error(f"登録エラー: {e}")
 
 # ==========================================
-# Tab 2: 週間プラン（7日分）一括生成 & カレンダー一括登録
+# Tab 3: 週間プラン（7日分）一括生成 & カレンダー一括登録
 # ==========================================
 with tab_weekly:
     st.subheader("📅 1週間分の練習メニュー一括設計 ＆ カレンダー同期")
-    st.caption("パワーカーブの弱点克服と平日の練習時間枠・休日のロング枠を組み合わせた7日間の最適プランを作成します。")
-
     col_wk1, col_wk2 = st.columns(2)
     with col_wk1:
         start_plan_date = st.date_input("プラン開始日（月曜日など）", value=datetime.now().date())
@@ -610,14 +771,14 @@ with tab_weekly:
                 st.success(f"🎉 完了！合計 {posted_count} 件のワークアウトをIntervals.icuカレンダーへ一括登録しました！")
 
 # ==========================================
-# Tab 3: AIコーチ・チャット相談
+# Tab 4: AIコーチ・チャット相談
 # ==========================================
 with tab_chat:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("例: 5分パワーに対して20分パワーを伸ばすコツは？ / 昨日のライドを評価して"):
+    if prompt := st.chat_input("例: 5分パワーに対して20分パワーを伸ばすコツは？ / 昨日のライドをどう思う？"):
         if not gemini_key:
             st.error("サイドバーで Gemini API Key を設定・保存してください。")
         else:
@@ -644,12 +805,3 @@ with tab_chat:
                     reply = response.text
                     st.markdown(reply)
                     st.session_state.messages.append({"role": "assistant", "content": reply})
-
-# ==========================================
-# Tab 4: 直近のアクティビティ履歴
-# ==========================================
-with tab_history:
-    if st.session_state.metrics and not st.session_state.metrics["activities_df"].empty:
-        st.dataframe(st.session_state.metrics["activities_df"], use_container_width=True)
-    else:
-        st.info("データがありません。上部の「🔄 最新データを再同期」を押してください。")
