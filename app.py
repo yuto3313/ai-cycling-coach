@@ -21,7 +21,7 @@ DEFAULT_CONFIG = {
     "athlete_id": "",
     "intervals_key": "",
     "gemini_key": "",
-    "model": "gemini-2.5-flash",
+    "model": "gemini-3.8-flash",
     "ftp": 280,
     "weight": 60.0,
     "target_ftp": 300,
@@ -614,18 +614,26 @@ with st.sidebar:
     gemini_key = st.text_input("Gemini API Key", value=cfg.get("gemini_key", ""), type="password")
 
     model_options = [
+        "gemini-3.8-flash",
+        "gemini-3.1-pro",
+        "gemini-4-argon",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
-        "gemini-1.5-pro",
+        "カスタム指定...",
     ]
-    cur_model = cfg.get("model", "gemini-2.5-flash")
-    idx_model = model_options.index(cur_model) if cur_model in model_options else 0
-    selected_model = st.selectbox(
+    cur_model = cfg.get("model", "gemini-3.8-flash")
+    idx_model = model_options.index(cur_model) if cur_model in model_options else (len(model_options) - 1 if cur_model else 0)
+    selected_option = st.selectbox(
         "🤖 AIモデル選択",
         model_options,
         index=idx_model,
-        help="Proモデルはより緻密な思考・分析が可能です（APIキーのプランに準拠）。日常利用にはFlashが超高速でおすすめです。"
+        help="Gemini 3.8 Flash, 3.1 Pro, 4 Argon 等の最新推論モデルを選択できます。"
     )
+    if selected_option == "カスタム指定...":
+        custom_model = st.text_input("モデルIDを入力", value=cur_model if cur_model not in model_options else "gemini-3.8-flash")
+        selected_model = custom_model.strip()
+    else:
+        selected_model = selected_option
 
     st.divider()
     st.subheader("⚡ フィジカル & 目標レース")
