@@ -88,7 +88,7 @@ class IntervalsClient:
         self.athlete_id = athlete_id.strip()
         self.auth = ("API_KEY", api_key.strip())
 
-    def get_wellness(self, days: int = 14) -> list:
+    def get_wellness(self, days: int = 40) -> list:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/wellness"
@@ -96,7 +96,7 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
-    def get_activities(self, days: int = 14) -> list:
+    def get_activities(self, days: int = 40) -> list:
         end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/activities"
@@ -104,7 +104,7 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
-    def get_power_curves(self, curves: str = "42d") -> dict:
+    def get_power_curves(self, curves: str = "1y") -> dict:
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/power-curves.json"
         res = requests.get(url, auth=self.auth, params={"curves": curves, "type": "Ride"}, timeout=10)
         res.raise_for_status()
@@ -515,7 +515,7 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
             w = p["watts"]
             wkg = p["wkg"]
             pdc_summary = (
-                f"- 直近42日ベストパワー: 15秒={w['15s']}W({wkg['15s']}W/kg), "
+                f"- 過去1年ベストパワー: 15秒={w['15s']}W({wkg['15s']}W/kg), "
                 f"1分={w['1m']}W({wkg['1m']}W/kg), 5分={w['5m']}W({wkg['5m']}W/kg), "
                 f"20分={w['20m']}W({wkg['20m']}W/kg), 60分={w['60m']}W({wkg['60m']}W/kg)\n"
                 f"- 推定eFTP: {p['eftp'] or '未算出'} W\n"
@@ -544,7 +544,7 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
 【パワーデュレーションカーブ (PDC / MMP) & 弱点診断】
 {pdc_summary}
 
-【直近14日間のライド履歴】
+【直近40日間のライド履歴】
 {act_summary}
 
 【Intervals.icu ワークアウト記法の書式ルール】
@@ -707,9 +707,9 @@ def sync_intervals_now(show_msg=True):
         with st.spinner("Intervals.icuから最新データ＆パワーカーブを取得中..."):
             save_config(current_cfg_dict)
             client = IntervalsClient(athlete_id, intervals_key)
-            wellness = client.get_wellness(days=14)
-            activities = client.get_activities(days=14)
-            pdc_raw = client.get_power_curves(curves="42d")
+            wellness = client.get_wellness(days=40)
+            activities = client.get_activities(days=40)
+            pdc_raw = client.get_power_curves(curves="1y")
             st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, weight, ftp)
         if show_msg:
             st.toast("✅ Intervals.icu 同期＆パワーカーブ解析完了！")
@@ -747,7 +747,7 @@ else:
 # パワーカーブ弱点診断バナー ＆ ビジュアルチャート
 if st.session_state.metrics and "pdc" in st.session_state.metrics:
     pdc = st.session_state.metrics["pdc"]
-    with st.expander("📈 直近42日のパワーカーブ (PDC) & AI弱点プロファイリング結果", expanded=True):
+    with st.expander("📈 過去1年のパワーカーブ (PDC) & AI弱点プロファイリング結果", expanded=True):
         st.info(pdc["diagnosis"])
         
         # PDCチャート描画
