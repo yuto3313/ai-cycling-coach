@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 import altair as alt
+import time
 
 CONFIG_FILE = "config.json"
 
@@ -563,18 +564,76 @@ Cooldown
 """
 
 
-def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str):
+def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str, max_retries: int = 3):
     """
-    Geminiのストリーミング応答ジェネレータ
+    Geminiのストリーミング応答ジェネレータ（503過負荷や一時エラー時の自動リトライ対応）
     """
-    response_stream = client_ai.models.generate_content_stream(
-        model=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=sys_prompt)
-    )
-    for chunk in response_stream:
-        if chunk.text:
-            yield chunk.text
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            response_stream = client_ai.models.generate_content_stream(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(system_instruction=sys_prompt)
+            )
+            yielded = False
+            for chunk in response_stream:
+                if chunk.text:
+                    yield chunk.text
+                    yielded = True
+            if yielded:
+                return
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_retryable = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED"])
+            if is_retryable and attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 2)
+                continue
+            else:
+                raise e
+    if last_err:
+        raise last_err
+
+
+def generate_content_with_retry(client_ai, model_name: str, contents, config, max_retries: int = 3):
+    """
+    Geminiの通常生成（503過負荷や一時エラー時の自動リトライ対応）
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client_ai.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_retryable = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED"])
+            if is_retryable and attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 2)
+                continue
+            else:
+                raise e
+    if last_err:
+        raise last_err
+
+
+def show_ai_error(prefix: str, e: Exception, current_model: str):
+    """
+    AI呼び出しエラー（503混雑、404モデル未検出、429制限等）をユーザーに親切に案内する
+    """
+    err_str = str(e)
+    st.error(f"{prefix}: {err_str}")
+    if any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"]):
+        alt_model = "gemini-3.1-pro" if "flash" in current_model else "gemini-3.8-flash"
+        st.warning(f"⚠️ Googleのサーバーでアクセス集中（一時的な混雑）が発生しています。数秒待って再試行するか、左サイドバーのAIモデルを『{alt_model}』に切り替えてお試しください。")
+    elif any(k in err_str for k in ["404", "NOT_FOUND"]):
+        st.warning("⚠️ 選択されたモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
+    elif any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED"]):
+        st.warning("⚠️ 一時的なリクエスト制限です。数十秒ほど待ってから再度お試しください。")
 
 
 # ==========================================
@@ -808,9 +867,7 @@ with tab_daily:
                     )
                     st.session_state.generated_workout = response_text
             except Exception as e:
-                st.error(f"AI生成エラー: {e}")
-                if "404" in str(e) or "NOT_FOUND" in str(e):
-                    st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
+                show_ai_error("AI生成エラー", e, selected_model)
 
     # 生成済みワークアウトの表示とグラフ化・ダウンロード
     if st.session_state.generated_workout:
@@ -891,8 +948,9 @@ with tab_weekly:
             try:
                 with st.spinner(f"AIコーチ（{selected_model}）が7日間のメニューを構造化生成中..."):
                     client_ai = genai.Client(api_key=gemini_key)
-                    response = client_ai.models.generate_content(
-                        model=selected_model,
+                    response = generate_content_with_retry(
+                        client_ai=client_ai,
+                        model_name=selected_model,
                         contents=weekly_req,
                         config=types.GenerateContentConfig(
                             system_instruction=sys_prompt,
@@ -902,9 +960,7 @@ with tab_weekly:
                     )
                     st.session_state.weekly_plan = json.loads(response.text)
             except Exception as e:
-                st.error(f"週間プラン生成エラー: {e}")
-                if "404" in str(e) or "NOT_FOUND" in str(e):
-                    st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
+                show_ai_error("週間プラン生成エラー", e, selected_model)
 
     if st.session_state.weekly_plan:
         plan = st.session_state.weekly_plan
@@ -1012,9 +1068,7 @@ with tab_debrief:
                         )
                         st.session_state.ride_review_result = review_text
                 except Exception as e:
-                    st.error(f"ライド診断エラー: {e}")
-                    if "404" in str(e) or "NOT_FOUND" in str(e):
-                        st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
+                    show_ai_error("ライド診断エラー", e, selected_model)
     else:
         st.info("ライド履歴がありません。上部の「🔄 最新データを再同期」を押してデータを取得してください。")
 
@@ -1051,9 +1105,7 @@ with tab_chat:
                     )
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 except Exception as e:
-                    st.error(f"チャット応答エラー: {e}")
-                    if "404" in str(e) or "NOT_FOUND" in str(e):
-                        st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
+                    show_ai_error("チャット応答エラー", e, selected_model)
 
 
 # ==========================================
