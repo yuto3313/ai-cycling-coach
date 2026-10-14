@@ -381,7 +381,11 @@ Cooldown
 # ==========================================
 # 4. Streamlit UI 構築
 # ==========================================
-icon_setting = "icon.png.jpg" if os.path.exists("icon.png.jpg") else "🚴‍♂️"
+icon_setting = "🚴‍♂️"
+for fname in ["icon.png", "icon.jpg", "icon.jpeg", "icon.png.jpg", "icon.png.jpeg"]:
+    if os.path.exists(fname):
+        icon_setting = fname
+        break
 st.set_page_config(
     page_title="AI Cycling Coach",
     page_icon=icon_setting,
