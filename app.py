@@ -63,6 +63,38 @@ def save_config(new_config: dict):
     except Exception as e:
         st.warning(f"設定ファイルの保存に失敗しました（クラウド環境の場合は正常です）: {e}")
 
+CACHE_FILE = "intervals_cache.json"
+
+def save_metrics_cache(metrics: dict):
+    if not metrics:
+        return
+    try:
+        data = {
+            "ctl": metrics.get("ctl"),
+            "atl": metrics.get("atl"),
+            "tsb": metrics.get("tsb"),
+            "weight": metrics.get("weight"),
+            "activities": metrics.get("activities", []),
+            "pdc": metrics.get("pdc", {}),
+            "cached_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_metrics_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            act_list = data.get("activities", [])
+            data["activities_df"] = pd.DataFrame(act_list).drop(columns=["id"], errors="ignore") if act_list else pd.DataFrame()
+            return data
+        except Exception:
+            pass
+    return None
+
 
 # ==========================================
 # 1. 週間プラン用の構造化データスキーマ (JSON出力用)
@@ -773,10 +805,27 @@ def sync_intervals_now(show_msg=True):
             activities = client.get_activities(days=40)
             pdc_raw = client.get_power_curves(curves="1y")
             st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, weight, ftp)
+            save_metrics_cache(st.session_state.metrics)
         if show_msg:
             st.toast("✅ Intervals.icu 同期＆パワーカーブ解析完了！")
     except Exception as e:
-        st.error(f"同期エラー: {e}")
+        err_msg = str(e)
+        resp_text = ""
+        if hasattr(e, "response") and e.response is not None:
+            resp_text = e.response.text
+        if "Maintenance" in resp_text:
+            st.warning(f"🚧 **Intervals.icu 公式サーバーが現在メンテナンス中です**（{resp_text.strip()} / 日本時間 13:45頃まで）。終了までしばらくお待ちください。")
+        elif "503" in err_msg or "Service Unavailable" in err_msg:
+            st.warning("🚧 **Intervals.icu 公式サーバーが現在メンテナンスまたは高負荷となっています**。終了までしばらくお待ちください。")
+        else:
+            st.error(f"同期エラー: {e}")
+
+        # 前回のキャッシュがあれば自動フォールバック
+        if st.session_state.metrics is None:
+            cached = load_metrics_cache()
+            if cached:
+                st.session_state.metrics = cached
+                st.info(f"ℹ️ 前回の同期キャッシュデータ（{cached.get('cached_at', '以前')} 取得分）を自動適用しました。このままメニュー生成やAI相談をご利用いただけます！")
 
 if st.session_state.metrics is None and athlete_id and intervals_key:
     sync_intervals_now(show_msg=False)
