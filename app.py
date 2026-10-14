@@ -48,6 +48,11 @@ def load_config() -> dict:
                 config[k] = st.secrets[k]
     except Exception:
         pass
+    # 非推奨・終了モデルの自動移行
+    if config.get("model") in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]:
+        config["model"] = "gemini-3.8-flash"
+    elif config.get("model") in ["gemini-2.5-pro", "gemini-1.5-pro"]:
+        config["model"] = "gemini-3.1-pro"
     return config
 
 def save_config(new_config: dict):
@@ -617,8 +622,6 @@ with st.sidebar:
         "gemini-3.8-flash",
         "gemini-3.1-pro",
         "gemini-4-argon",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
         "カスタム指定...",
     ]
     cur_model = cfg.get("model", "gemini-3.8-flash")
@@ -796,13 +799,18 @@ with tab_daily:
 2. メニュー詳細（各セクションの目標ワット数 `{ftp}W` 基準の実数値とケイデンス）
 3. Intervals.icu カレンダー登録用のワークアウトコードブロック（必ず ```workout から始めて記述すること）
 """
-            client_ai = genai.Client(api_key=gemini_key)
-            st.session_state.generated_workout = ""
-            with st.spinner("AIコーチがメニューを設計中..."):
-                response_text = st.write_stream(
-                    stream_gemini_response(client_ai, selected_model, user_req, sys_prompt)
-                )
-                st.session_state.generated_workout = response_text
+            try:
+                client_ai = genai.Client(api_key=gemini_key)
+                st.session_state.generated_workout = ""
+                with st.spinner(f"AIコーチ（{selected_model}）がメニューを設計中..."):
+                    response_text = st.write_stream(
+                        stream_gemini_response(client_ai, selected_model, user_req, sys_prompt)
+                    )
+                    st.session_state.generated_workout = response_text
+            except Exception as e:
+                st.error(f"AI生成エラー: {e}")
+                if "404" in str(e) or "NOT_FOUND" in str(e):
+                    st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
 
     # 生成済みワークアウトの表示とグラフ化・ダウンロード
     if st.session_state.generated_workout:
@@ -880,18 +888,23 @@ with tab_weekly:
 - 現在のTSBとパワーデュレーションカーブの弱点診断（5分対20分のバランス等）を反映し、メリハリのある7日間にすること。
 - 練習日の `workout_code` には、Intervals.icuのカレンダーでそのままグラフ化される正確なワークアウト記法（Warmup / Main Set / Cooldown、`- 10m 90%` 等の形式）を記述すること。
 """
-            with st.spinner(f"AIコーチ（{selected_model}）が7日間のメニューを構造化生成中..."):
-                client_ai = genai.Client(api_key=gemini_key)
-                response = client_ai.models.generate_content(
-                    model=selected_model,
-                    contents=weekly_req,
-                    config=types.GenerateContentConfig(
-                        system_instruction=sys_prompt,
-                        response_mime_type="application/json",
-                        response_schema=WeeklyPlanResponse,
+            try:
+                with st.spinner(f"AIコーチ（{selected_model}）が7日間のメニューを構造化生成中..."):
+                    client_ai = genai.Client(api_key=gemini_key)
+                    response = client_ai.models.generate_content(
+                        model=selected_model,
+                        contents=weekly_req,
+                        config=types.GenerateContentConfig(
+                            system_instruction=sys_prompt,
+                            response_mime_type="application/json",
+                            response_schema=WeeklyPlanResponse,
+                        )
                     )
-                )
-                st.session_state.weekly_plan = json.loads(response.text)
+                    st.session_state.weekly_plan = json.loads(response.text)
+            except Exception as e:
+                st.error(f"週間プラン生成エラー: {e}")
+                if "404" in str(e) or "NOT_FOUND" in str(e):
+                    st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
 
     if st.session_state.weekly_plan:
         plan = st.session_state.weekly_plan
@@ -989,14 +1002,19 @@ with tab_debrief:
 3. **今日のGoodポイント**: 褒めるべき点や成果
 4. **リカバリー＆次回へのアドバイス**: 今夜の栄養（糖質・タンパク質補給）、ストレッチ、明日以降の調整
 """
-                client_ai = genai.Client(api_key=gemini_key)
-                st.divider()
-                st.subheader("📋 AIコーチからのフィードバック")
-                with st.spinner("AIコーチがデータを診断中..."):
-                    review_text = st.write_stream(
-                        stream_gemini_response(client_ai, selected_model, debrief_req, sys_prompt)
-                    )
-                    st.session_state.ride_review_result = review_text
+                try:
+                    client_ai = genai.Client(api_key=gemini_key)
+                    st.divider()
+                    st.subheader("📋 AIコーチからのフィードバック")
+                    with st.spinner(f"AIコーチ（{selected_model}）がデータを診断中..."):
+                        review_text = st.write_stream(
+                            stream_gemini_response(client_ai, selected_model, debrief_req, sys_prompt)
+                        )
+                        st.session_state.ride_review_result = review_text
+                except Exception as e:
+                    st.error(f"ライド診断エラー: {e}")
+                    if "404" in str(e) or "NOT_FOUND" in str(e):
+                        st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
     else:
         st.info("ライド履歴がありません。上部の「🔄 最新データを再同期」を押してデータを取得してください。")
 
@@ -1018,19 +1036,24 @@ with tab_chat:
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
-                client_ai = genai.Client(api_key=gemini_key)
-                history_contents = [
-                    types.Content(
-                        role="user" if m["role"] == "user" else "model",
-                        parts=[types.Part.from_text(text=m["content"])]
+                try:
+                    sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
+                    client_ai = genai.Client(api_key=gemini_key)
+                    history_contents = [
+                        types.Content(
+                            role="user" if m["role"] == "user" else "model",
+                            parts=[types.Part.from_text(text=m["content"])]
+                        )
+                        for m in st.session_state.messages
+                    ]
+                    reply = st.write_stream(
+                        stream_gemini_response(client_ai, selected_model, history_contents, sys_prompt)
                     )
-                    for m in st.session_state.messages
-                ]
-                reply = st.write_stream(
-                    stream_gemini_response(client_ai, selected_model, history_contents, sys_prompt)
-                )
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                except Exception as e:
+                    st.error(f"チャット応答エラー: {e}")
+                    if "404" in str(e) or "NOT_FOUND" in str(e):
+                        st.warning("⚠️ 選択したモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
 
 
 # ==========================================
