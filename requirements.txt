@@ -3,3 +3,4 @@ requests
 pandas
 tabulate
 google-genai
+altair
