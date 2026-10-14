@@ -161,6 +161,66 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
+    def get_activity_segments(self, activity_id: str) -> list:
+        """Stravaセグメント一覧と各セグメントのタイム・パワー・心拍を算出"""
+        try:
+            url_seg = f"{self.BASE_URL}/activity/{activity_id}/segments"
+            res_seg = requests.get(url_seg, auth=self.auth, timeout=10)
+            if res_seg.status_code != 200:
+                return []
+            segs = res_seg.json()
+            if not segs or not isinstance(segs, list):
+                return []
+
+            url_streams = f"{self.BASE_URL}/activity/{activity_id}/streams.json"
+            res_streams = requests.get(url_streams, auth=self.auth, params={"types": "time,watts,heartrate,distance"}, timeout=10)
+            if res_streams.status_code != 200:
+                return [
+                    {
+                        "セグメント名": s.get("name", "Unknown"),
+                        "タイム": "--",
+                        "距離(km)": "--",
+                        "平均パワー(W)": "--",
+                        "最大パワー(W)": "--",
+                        "平均心拍(bpm)": "--"
+                    }
+                    for s in segs
+                ]
+
+            streams_list = res_streams.json()
+            s_dict = {s["type"]: s["data"] for s in streams_list if "type" in s and "data" in s}
+            times = s_dict.get("time", [])
+            watts = s_dict.get("watts", [])
+            hrs = s_dict.get("heartrate", [])
+            dists = s_dict.get("distance", [])
+
+            results = []
+            for s in segs:
+                si = s.get("start_index", 0)
+                ei = s.get("end_index", 0)
+                dur = times[ei] - times[si] if ei < len(times) and si < len(times) else 0
+                dist_m = dists[ei] - dists[si] if ei < len(dists) and si < len(dists) else 0
+                w_slice = [w for w in watts[si:ei+1] if w is not None] if watts else []
+                avg_w = round(sum(w_slice) / len(w_slice)) if w_slice else 0
+                max_w = max(w_slice) if w_slice else 0
+                hr_slice = [h for h in hrs[si:ei+1] if h is not None] if hrs else []
+                avg_hr = round(sum(hr_slice) / len(hr_slice)) if hr_slice else 0
+
+                m, ss = divmod(dur, 60)
+                time_str = f"{m}:{ss:02d}"
+
+                results.append({
+                    "セグメント名": s.get("name", "名称不明"),
+                    "タイム": time_str,
+                    "距離(km)": round(dist_m / 1000, 2),
+                    "平均パワー(W)": avg_w,
+                    "最大パワー(W)": max_w,
+                    "平均心拍(bpm)": avg_hr if avg_hr > 0 else "--",
+                })
+            return results
+        except Exception:
+            return []
+
 
 # ==========================================
 # 3. ワークアウト解析・ZWO生成・Altairチャート
@@ -500,9 +560,10 @@ def parse_intervals_data(wellness_raw: list, activities_raw: list, pdc_raw: dict
             "日付": act.get("start_date_local", "")[:10],
             "ワークアウト名": act.get("name", "Ride"),
             "時間(分)": moving_time_min,
+            "距離(km)": round((act.get("distance") or 0) / 1000, 1),
             "TSS": round(act.get("icu_training_load") or 0),
-            "NP(W)": round(act.get("icu_weighted_avg_watts") or 0),
-            "平均(W)": round(act.get("average_watts") or 0),
+            "NP(W)": round(act.get("icu_weighted_avg_watts") or act.get("weighted_average_watts") or 0),
+            "平均(W)": round(act.get("icu_average_watts") or act.get("average_watts") or 0),
             "IF": round((act.get("icu_intensity") or 0) / 100, 2) if act.get("icu_intensity") else 0.0,
             "心拍(bpm)": round(act.get("average_heartrate") or 0),
         })
@@ -1082,6 +1143,27 @@ with tab_debrief:
         col_r3.metric("NP / 平均パワー", f"{selected_ride['NP(W)']} W", f"平均: {selected_ride['平均(W)']} W")
         col_r4.metric("平均心拍", f"{selected_ride['心拍(bpm)']} bpm" if selected_ride['心拍(bpm)'] > 0 else "--")
 
+        # Stravaセグメントログの取得と表示
+        act_id = selected_ride.get("id")
+        current_segments = []
+        if act_id and athlete_id and intervals_key:
+            cache_key = f"segments_{act_id}"
+            if cache_key not in st.session_state:
+                client = IntervalsClient(athlete_id, intervals_key)
+                st.session_state[cache_key] = client.get_activity_segments(act_id)
+            current_segments = st.session_state[cache_key]
+
+        if current_segments:
+            with st.expander(f"📍 このライドの Strava セグメントログ ({len(current_segments)}件)", expanded=True):
+                df_seg = pd.DataFrame(current_segments)
+                if weight > 0:
+                    df_seg["W/kg"] = df_seg["平均パワー(W)"].apply(
+                        lambda w: round(w / weight, 2) if isinstance(w, (int, float)) and w > 0 else "--"
+                    )
+                    cols = ["セグメント名", "タイム", "距離(km)", "平均パワー(W)", "W/kg", "最大パワー(W)", "平均心拍(bpm)"]
+                    df_seg = df_seg[[c for c in cols if c in df_seg.columns]]
+                st.dataframe(df_seg, use_container_width=True)
+
         user_ride_feedback = st.text_input("ライド時の体感メモ・補足（任意）", placeholder="例: 後半脚がタレた、補給が足りなかった、最後まで踏み切れた等")
 
         if st.button("🔍 このライドをAIコーチにレビューしてもらう", type="primary", use_container_width=True):
@@ -1089,23 +1171,35 @@ with tab_debrief:
                 st.error("サイドバーで Gemini API Key を設定・保存してください。")
             else:
                 sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
+                
+                seg_summary = "セグメントなし（平坦またはインドア）"
+                if current_segments:
+                    seg_summary = "\n".join([
+                        f"- {s['セグメント名']}: タイム {s['タイム']}, 距離 {s['距離(km)']}km, 平均 {s['平均パワー(W)']}W, 最大 {s['最大パワー(W)']}W, 平均心拍 {s['平均心拍(bpm)']}bpm"
+                        for s in current_segments[:8]
+                    ])
+
                 debrief_req = f"""
 以下のライド実績について、プロのサイクリングコーチとして多角的な分析とアドバイスを行ってください。
 
 【対象ライドデータ】
 - 日付: {selected_ride['日付']}
 - ワークアウト名: {selected_ride['ワークアウト名']}
-- 時間: {selected_ride['時間(分)']} 分
+- 時間: {selected_ride['時間(分)']} 分 / 距離: {selected_ride.get('距離(km)', '--')} km
 - TSS: {selected_ride['TSS']} / IF: {selected_ride['IF']}
 - NP: {selected_ride['NP(W)']} W / 平均パワー: {selected_ride['平均(W)']} W (FTP: {ftp}W)
 - 平均心拍: {selected_ride['心拍(bpm)']} bpm
 - アスリートの体感メモ: {user_ride_feedback or '特になし'}
 
+【Strava 通過セグメント実績】
+{seg_summary}
+
 【分析・フィードバック項目】
 1. **総括と負荷評価**: 現在のTSBやフェーズに照らし合わせたTSS/IFの適切さ
 2. **強度と効率の分析**: NPと平均Wの乖離（変動性VI）、パワーに対する心拍の妥当性（心拍ドリフトや疲労の兆候）
-3. **今日のGoodポイント**: 褒めるべき点や成果
-4. **リカバリー＆次回へのアドバイス**: 今夜の栄養（糖質・タンパク質補給）、ストレッチ、明日以降の調整
+3. **Stravaセグメント分析**: 登坂やスプリント各セグメントでの踏み込み・ペーシング・FTP比評価
+4. **今日のGoodポイント**: 褒めるべき点や成果
+5. **リカバリー＆次回へのアドバイス**: 今夜の栄養（糖質・タンパク質補給）、ストレッチ、明日以降の調整
 """
                 try:
                     client_ai = genai.Client(api_key=gemini_key)
