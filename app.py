@@ -312,7 +312,7 @@ Cooldown
 # ==========================================
 st.set_page_config(
     page_title="AI Cycling Coach",
-    page_icon="🚴‍♂️",
+    page_icon="icon.png",
     layout="wide",
     initial_sidebar_state="collapsed" # スマホで開いたときにメイン画面を広く表示
 )
