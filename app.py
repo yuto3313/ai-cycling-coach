@@ -657,59 +657,91 @@ Cooldown
 """
 
 
-def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str, max_retries: int = 3):
+def get_candidate_models(primary_model: str) -> list[str]:
+    """クォータ制限時のフォールバック順序リストを生成"""
+    defaults = ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-4-argon", "gemini-2.0-flash"]
+    candidates = [primary_model] if primary_model else []
+    for m in defaults:
+        if m not in candidates:
+            candidates.append(m)
+    return candidates
+
+
+def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str):
     """
-    Geminiのストリーミング応答ジェネレータ（503過負荷や一時エラー時の自動リトライ対応）
+    指定モデルが429（クォータ上限）や503、404の場合、
+    制限のない代替モデルへ自動的にフォールバックしてストリーミング生成を行う。
     """
+    candidates = get_candidate_models(model_name)
     last_err = None
-    for attempt in range(max_retries):
-        try:
-            response_stream = client_ai.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(system_instruction=sys_prompt)
-            )
-            yielded = False
-            for chunk in response_stream:
-                if chunk.text:
-                    yield chunk.text
-                    yielded = True
-            if yielded:
-                return
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            is_retryable = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED"])
-            if is_retryable and attempt < max_retries - 1:
-                time.sleep((attempt + 1) * 2)
-                continue
-            else:
-                raise e
+
+    for current_m in candidates:
+        for attempt in range(2):
+            try:
+                response_stream = client_ai.models.generate_content_stream(
+                    model=current_m,
+                    contents=contents,
+                    config=types.GenerateContentConfig(system_instruction=sys_prompt)
+                )
+                yielded = False
+                for chunk in response_stream:
+                    if not yielded and current_m != model_name:
+                        st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
+                    if chunk.text:
+                        yield chunk.text
+                        yielded = True
+                if yielded:
+                    return
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"])
+                is_not_found = any(k in err_str for k in ["404", "NOT_FOUND"])
+                if is_quota or is_not_found:
+                    break
+                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"])
+                if is_busy and attempt < 1:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
+
     if last_err:
         raise last_err
 
 
-def generate_content_with_retry(client_ai, model_name: str, contents, config, max_retries: int = 3):
+def generate_content_with_retry(client_ai, model_name: str, contents, config):
     """
-    Geminiの通常生成（503過負荷や一時エラー時の自動リトライ対応）
+    通常生成（429クォータ上限時の自動モデルフォールバック対応）
     """
+    candidates = get_candidate_models(model_name)
     last_err = None
-    for attempt in range(max_retries):
-        try:
-            return client_ai.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            is_retryable = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED"])
-            if is_retryable and attempt < max_retries - 1:
-                time.sleep((attempt + 1) * 2)
-                continue
-            else:
-                raise e
+
+    for current_m in candidates:
+        for attempt in range(2):
+            try:
+                res = client_ai.models.generate_content(
+                    model=current_m,
+                    contents=contents,
+                    config=config
+                )
+                if current_m != model_name:
+                    st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
+                return res
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"])
+                is_not_found = any(k in err_str for k in ["404", "NOT_FOUND"])
+                if is_quota or is_not_found:
+                    break
+                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"])
+                if is_busy and attempt < 1:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
+
     if last_err:
         raise last_err
 
@@ -720,13 +752,12 @@ def show_ai_error(prefix: str, e: Exception, current_model: str):
     """
     err_str = str(e)
     st.error(f"{prefix}: {err_str}")
-    if any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"]):
-        alt_model = "gemini-3.1-pro" if "flash" in current_model else "gemini-3.8-flash"
-        st.warning(f"⚠️ Googleのサーバーでアクセス集中（一時的な混雑）が発生しています。数秒待って再試行するか、左サイドバーのAIモデルを『{alt_model}』に切り替えてお試しください。")
+    if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"]):
+        st.warning("⚠️ 利用可能な全AIモデル（3.8 Flash / 3.1 Pro / 4 Argon 等）の無料利用枠上限に達しました。Google AI Studio のリセット時刻（翌日）をお待ちいただくか、有料課金プラン（従量制）の紐付けをご検討ください。")
+    elif any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"]):
+        st.warning("⚠️ Googleのサーバーでアクセス集中（一時的な混雑）が発生しています。数秒待って再試行してください。")
     elif any(k in err_str for k in ["404", "NOT_FOUND"]):
-        st.warning("⚠️ 選択されたモデルが利用できない可能性があります。サイドバーのモデルを『gemini-3.8-flash』に変更してみてください。")
-    elif any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED"]):
-        st.warning("⚠️ 一時的なリクエスト制限です。数十秒ほど待ってから再度お試しください。")
+        st.warning("⚠️ 選択されたモデルが利用できない可能性があります。サイドバーのモデル設定をご確認ください。")
 
 
 # ==========================================
@@ -782,7 +813,7 @@ with st.sidebar:
         "🤖 AIモデル選択",
         model_options,
         index=idx_model,
-        help="Gemini 3.8 Flash, 3.1 Pro, 4 Argon 等の最新推論モデルを選択できます。"
+        help="Gemini 3.8 Flash, 3.1 Pro, 4 Argon 等の最新推論モデルを選択できます。利用枠制限（429）に達した場合は自動で別モデルへ切り替わります。"
     )
     if selected_option == "カスタム指定...":
         custom_model = st.text_input("モデルIDを入力", value=cur_model if cur_model not in model_options else "gemini-3.8-flash")
