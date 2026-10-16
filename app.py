@@ -635,7 +635,7 @@ def build_workout_chart(df: pd.DataFrame, ftp: int):
 
     max_w = max(ftp * 1.25, df["power_w"].max() * 1.1)
 
-    chart = alt.Chart(df).mark_rect(stroke="#0f172a", strokeWidth=0.6, cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+    chart = alt.Chart(df).mark_rect(stroke="#1e293b", strokeWidth=0.6, cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
         x=alt.X("start_min:Q", title="経過時間 (分)", axis=alt.Axis(grid=True)),
         x2="end_min:Q",
         y=alt.Y("power_w:Q", title="目標パワー (W)", scale=alt.Scale(domain=[0, max_w])),
@@ -653,13 +653,13 @@ def build_workout_chart(df: pd.DataFrame, ftp: int):
 
     ftp_df = pd.DataFrame([{"ftp": ftp, "label": f"FTP: {ftp}W"}])
     ftp_line = alt.Chart(ftp_df).mark_rule(
-        color="#f8fafc", strokeDash=[5, 4], strokeWidth=1.8
+        color="#dc2626", strokeDash=[6, 4], strokeWidth=2.2
     ).encode(
         y="ftp:Q",
         tooltip=[alt.Tooltip("label:N", title="基準ライン")]
     )
 
-    return (chart + ftp_line).properties(height=230)
+    return (chart + ftp_line).properties(height=235)
 
 
 def build_tiz_bar_chart(zone_mins: dict):
@@ -667,22 +667,22 @@ def build_tiz_bar_chart(zone_mins: dict):
     if not zone_mins:
         return None
     color_map = {
-        "Z1 回復": "#94a3b8",
-        "Z2 有酸素": "#38bdf8",
-        "Z3 テンポ/SST": "#22c55e",
-        "Z4 閾値(FTP)": "#eab308",
-        "Z5 VO2max": "#f97316",
-        "Z6 無酸素": "#ef4444",
+        "Z1 回復": "#64748b",
+        "Z2 有酸素": "#0284c7",
+        "Z3 テンポ/SST": "#16a34a",
+        "Z4 閾値(FTP)": "#d97706",
+        "Z5 VO2max": "#ea580c",
+        "Z6 無酸素": "#dc2626",
     }
     order_list = list(color_map.keys())
-    rows = [{"zone": k, "minutes": v, "color": color_map.get(k, "#38bdf8")} for k, v in zone_mins.items()]
+    rows = [{"zone": k, "minutes": v, "color": color_map.get(k, "#0284c7")} for k, v in zone_mins.items()]
     df_z = pd.DataFrame(rows)
     return alt.Chart(df_z).mark_bar(cornerRadiusEnd=4).encode(
         x=alt.X("minutes:Q", title="滞在時間 (分)"),
         y=alt.Y("zone:N", sort=order_list, title="パワーゾーン"),
         color=alt.Color("color:N", scale=None),
         tooltip=[alt.Tooltip("zone:N", title="ゾーン"), alt.Tooltip("minutes:Q", title="時間 (分)")]
-    ).properties(height=155)
+    ).properties(height=165)
 
 
 def build_pdc_chart(pdc_info: dict, weight: float, current_ftp: int, target_ftp: int):
@@ -718,14 +718,14 @@ def build_pdc_chart(pdc_info: dict, weight: float, current_ftp: int, target_ftp:
         ]
     )
 
-    line = base.mark_line(color="#38bdf8", strokeWidth=3, point=alt.OverlayMarkDef(size=70, color="#38bdf8"))
-    area = base.mark_area(opacity=0.18, color="#38bdf8")
+    line = base.mark_line(color="#0284c7", strokeWidth=3, point=alt.OverlayMarkDef(size=75, color="#0284c7"))
+    area = base.mark_area(opacity=0.18, color="#0284c7")
 
     ref_df = pd.DataFrame([
-        {"level": f"目標FTP ({tar_pwr} W/kg)", "val": tar_pwr, "color": "#f87171"},
-        {"level": f"現在FTP ({cur_pwr} W/kg)", "val": cur_pwr, "color": "#4ade80"},
+        {"level": f"目標FTP ({tar_pwr} W/kg)", "val": tar_pwr, "color": "#dc2626"},
+        {"level": f"現在FTP ({cur_pwr} W/kg)", "val": cur_pwr, "color": "#16a34a"},
     ])
-    rule = alt.Chart(ref_df).mark_rule(strokeDash=[4, 4], strokeWidth=2).encode(
+    rule = alt.Chart(ref_df).mark_rule(strokeDash=[5, 4], strokeWidth=2.2).encode(
         y="val:Q",
         color=alt.Color("color:N", scale=None),
         tooltip=[alt.Tooltip("level:N", title="基準")]
@@ -740,11 +740,11 @@ def build_rider_profile_chart(pdc_info: dict):
     if not scores:
         return None
     rows = [
-        {"axis": "15秒 スプリント (NM)", "score": scores.get("15s", 0), "color": "#a855f7"},
-        {"axis": "1分 無酸素耐性 (AC)", "score": scores.get("1m", 0), "color": "#ef4444"},
-        {"axis": "5分 有酸素天井 (VO2max)", "score": scores.get("5m", 0), "color": "#f97316"},
-        {"axis": "20分 乳酸閾値 (LT/FTP)", "score": scores.get("20m", 0), "color": "#eab308"},
-        {"axis": "60分 長時間持久力 (Stamina)", "score": scores.get("60m", 0), "color": "#22c55e"},
+        {"axis": "15秒 スプリント (NM)", "score": scores.get("15s", 0), "color": "#7c3aed"},
+        {"axis": "1分 無酸素耐性 (AC)", "score": scores.get("1m", 0), "color": "#dc2626"},
+        {"axis": "5分 有酸素天井 (VO2max)", "score": scores.get("5m", 0), "color": "#ea580c"},
+        {"axis": "20分 乳酸閾値 (LT/FTP)", "score": scores.get("20m", 0), "color": "#d97706"},
+        {"axis": "60分 長時間持久力 (Stamina)", "score": scores.get("60m", 0), "color": "#16a34a"},
     ]
     df_r = pd.DataFrame(rows)
     return alt.Chart(df_r).mark_bar(cornerRadiusEnd=5).encode(
@@ -752,7 +752,7 @@ def build_rider_profile_chart(pdc_info: dict):
         y=alt.Y("axis:N", sort=[r["axis"] for r in rows], title="能力領域"),
         color=alt.Color("color:N", scale=None),
         tooltip=[alt.Tooltip("axis:N", title="領域"), alt.Tooltip("score:Q", title="スコア (/100)")]
-    ).properties(height=190)
+    ).properties(height=200)
 
 
 def build_wellness_chart(wellness_history: list):
@@ -764,10 +764,10 @@ def build_wellness_chart(wellness_history: list):
         return None
 
     base = alt.Chart(df_w).encode(
-        x=alt.X("date:N", title="日付")
+        x=alt.X("date:N", sort=None, title="日付")
     )
 
-    hrv_line = base.mark_line(color="#a855f7", strokeWidth=2.5, point=True).encode(
+    hrv_line = base.mark_line(color="#7c3aed", strokeWidth=2.8, point=True).encode(
         y=alt.Y("hrv:Q", title="HRV (ms) / 睡眠スコア"),
         tooltip=[
             alt.Tooltip("date:N", title="日付"),
@@ -778,7 +778,7 @@ def build_wellness_chart(wellness_history: list):
         ]
     )
 
-    sleep_line = base.mark_line(color="#38bdf8", strokeDash=[4, 2], strokeWidth=2, point=True).encode(
+    sleep_line = base.mark_line(color="#0284c7", strokeDash=[4, 2], strokeWidth=2.2, point=True).encode(
         y=alt.Y("sleep_score:Q"),
         tooltip=[
             alt.Tooltip("date:N", title="日付"),
@@ -788,26 +788,26 @@ def build_wellness_chart(wellness_history: list):
         ]
     )
 
-    return (hrv_line + sleep_line).properties(height=195)
+    return (hrv_line + sleep_line).properties(height=205)
 
 
 def build_pmc_chart(pmc_history: list):
-    """過去40日間のPMC (CTL / ATL / TSB) 推移チャート"""
+    """過去40日間のPMC (CTL / ATL / TSB) 推移チャート（Altair v6完全互換）"""
     if not pmc_history:
         return None
     df_p = pd.DataFrame(pmc_history)
     if df_p.empty:
         return None
 
-    base = alt.Chart(df_p).encode(x=alt.X("date:N", title="日付"))
+    df_p["tsb_color"] = df_p["tsb"].apply(
+        lambda v: "#16a34a" if v >= 0 else ("#d97706" if v >= -20 else "#dc2626")
+    )
+
+    base = alt.Chart(df_p).encode(x=alt.X("date:N", sort=None, title="日付"))
 
     tsb_bars = base.mark_bar(opacity=0.45).encode(
         y=alt.Y("tsb:Q", title="CTL / ATL / TSB"),
-        color=alt.condition(
-            alt.datum.tsb >= 0,
-            alt.value("#4ade80"),  # プラスはグリーン
-            alt.condition(alt.datum.tsb >= -20, alt.value("#eab308"), alt.value("#ef4444"))
-        ),
+        color=alt.Color("tsb_color:N", scale=None),
         tooltip=[
             alt.Tooltip("date:N", title="日付"),
             alt.Tooltip("ctl:Q", title="CTL (Fitness)"),
@@ -816,10 +816,10 @@ def build_pmc_chart(pmc_history: list):
         ]
     )
 
-    ctl_line = base.mark_line(color="#38bdf8", strokeWidth=2.8).encode(y="ctl:Q")
-    atl_line = base.mark_line(color="#f43f5e", strokeWidth=2.0, strokeDash=[3, 2]).encode(y="atl:Q")
+    ctl_line = base.mark_line(color="#0284c7", strokeWidth=2.8).encode(y="ctl:Q")
+    atl_line = base.mark_line(color="#e11d48", strokeWidth=2.2, strokeDash=[3, 2]).encode(y="atl:Q")
 
-    return (tsb_bars + ctl_line + atl_line).properties(height=220)
+    return (tsb_bars + ctl_line + atl_line).properties(height=205)
 
 
 def build_ef_trend_chart(activities: list):
@@ -841,7 +841,7 @@ def build_ef_trend_chart(activities: list):
         return None
     df_e = pd.DataFrame(valid)
     base = alt.Chart(df_e).encode(x=alt.X("date:N", sort=None, title="ライド日"))
-    bars = base.mark_bar(opacity=0.25, color="#94a3b8").encode(
+    bars = base.mark_bar(opacity=0.3, color="#64748b").encode(
         y=alt.Y("tss:Q", title="TSS (棒)"),
         tooltip=[
             alt.Tooltip("full_date:N", title="日付"),
@@ -852,7 +852,7 @@ def build_ef_trend_chart(activities: list):
             alt.Tooltip("hr:Q", title="平均心拍 (bpm)"),
         ]
     )
-    line = base.mark_line(color="#22c55e", strokeWidth=3, point=alt.OverlayMarkDef(size=65, color="#22c55e")).encode(
+    line = base.mark_line(color="#16a34a", strokeWidth=3, point=alt.OverlayMarkDef(size=70, color="#16a34a")).encode(
         y=alt.Y("ef:Q", title="Efficiency Factor (EF = NP/HR)", scale=alt.Scale(zero=False)),
         tooltip=[
             alt.Tooltip("full_date:N", title="日付"),
@@ -1569,32 +1569,106 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; max-width: 1280px; }
+    .block-container { padding-top: 1.1rem; padding-bottom: 2.5rem; max-width: 1320px; }
+
+    /* KPI メトリクスカード：純白背景＋ディープネイビー文字＋スカイブルー左アクセントで視認性を極限まで向上 */
     div[data-testid="stMetric"] {
-        background: linear-gradient(145deg, rgba(30, 41, 59, 0.75), rgba(15, 23, 42, 0.85));
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        padding: 0.75rem 0.95rem;
-        border-radius: 0.75rem;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        background: #ffffff !important;
+        border: 1px solid #cbd5e1 !important;
+        border-left: 5px solid #0284c7 !important;
+        padding: 0.85rem 1.05rem !important;
+        border-radius: 0.75rem !important;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06) !important;
     }
-    div[data-testid="stMetricValue"] { font-size: 1.4rem !important; font-weight: 700 !important; }
-    div[data-testid="stMetricLabel"] { font-size: 0.82rem !important; opacity: 0.88; }
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricLabel"] span {
+        color: #334155 !important;
+        font-size: 0.84rem !important;
+        font-weight: 700 !important;
+        opacity: 1 !important;
+    }
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] > div {
+        color: #0f172a !important;
+        font-size: 1.5rem !important;
+        font-weight: 800 !important;
+        letter-spacing: -0.02em !important;
+    }
+    div[data-testid="stMetricDelta"],
+    div[data-testid="stMetricDelta"] > div {
+        font-weight: 600 !important;
+        font-size: 0.78rem !important;
+    }
+
+    /* トップ・テレメトリーバナー：爽やかなスカイブルーグラデーション＋濃紺テキスト */
     .telemetry-banner {
-        background: linear-gradient(90deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 58, 138, 0.45) 100%);
-        border: 1px solid rgba(56, 189, 248, 0.3);
-        border-radius: 0.85rem;
-        padding: 0.85rem 1.2rem;
-        margin-bottom: 0.9rem;
+        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%) !important;
+        border: 1px solid #7dd3fc !important;
+        border-left: 6px solid #0284c7 !important;
+        border-radius: 0.85rem !important;
+        padding: 1.0rem 1.35rem !important;
+        margin-bottom: 1.0rem !important;
+        color: #0f172a !important;
+        box-shadow: 0 3px 10px rgba(2, 132, 199, 0.08) !important;
     }
+    .telemetry-banner h2,
+    .telemetry-banner span,
+    .telemetry-banner p,
+    .telemetry-banner div {
+        color: #0f172a !important;
+    }
+    .telemetry-sub {
+        color: #334155 !important;
+        font-weight: 600 !important;
+    }
+
+    /* ステータスピルバッジ：白背景＋ブルー枠＋濃青テキストでくっきり表示 */
     .status-pill {
         display: inline-block;
-        padding: 0.18rem 0.65rem;
+        padding: 0.24rem 0.75rem;
         border-radius: 999px;
         font-size: 0.78rem;
-        font-weight: 600;
+        font-weight: 700;
         margin-right: 0.4rem;
-        background: rgba(56, 189, 248, 0.15);
-        border: 1px solid rgba(56, 189, 248, 0.35);
+        margin-top: 0.2rem;
+        background: #ffffff !important;
+        color: #0369a1 !important;
+        border: 1px solid #38bdf8 !important;
+        box-shadow: 0 1px 2px rgba(2, 132, 199, 0.08);
+    }
+
+    /* エクスパンダー（折りたたみパネル）の視認性強化 */
+    div[data-testid="stExpander"] {
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 0.75rem !important;
+        background: #ffffff !important;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04) !important;
+        margin-bottom: 0.75rem !important;
+    }
+    div[data-testid="stExpander"] details summary {
+        background: #f8fafc !important;
+        color: #0f172a !important;
+        font-weight: 700 !important;
+        border-radius: 0.75rem !important;
+        padding: 0.65rem 1rem !important;
+    }
+    div[data-testid="stExpander"] details summary p {
+        color: #0f172a !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+    }
+
+    /* タブバーの視認性・操作感向上 */
+    button[data-baseweb="tab"] {
+        font-weight: 700 !important;
+        color: #334155 !important;
+        padding: 0.55rem 1rem !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: #0284c7 !important;
+        background-color: #f0f9ff !important;
+        border-radius: 0.5rem 0.5rem 0 0 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1885,8 +1959,8 @@ with st.sidebar:
 if not is_owner_mode and (not intervals_key or not gemini_key):
     st.markdown("""
     <div class="telemetry-banner">
-        <h2 style="margin:0; font-size:1.6rem;">🚴‍♂️ AI Cycling Coach Pro</h2>
-        <p style="margin:0.3rem 0 0 0; opacity:0.88; font-size:0.95rem;">
+        <h2 style="margin:0; font-size:1.6rem; color:#0f172a; font-weight:800;">🚴‍♂️ AI Cycling Coach Pro</h2>
+        <p style="margin:0.35rem 0 0 0; color:#1e293b; font-weight:600; font-size:0.95rem;">
             Intervals.icu の生理学データ（HRV・睡眠・CP/W'・Stravaセグメント）× Google Gemini AI によるパーソナル・ロードレースコーチングシステム
         </p>
     </div>
@@ -2072,8 +2146,8 @@ with hdr_col1:
     <div class="telemetry-banner">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
             <div>
-                <span style="font-size:1.35rem; font-weight:800;">🚴‍♂️ AI Cycling Coach Pro</span>
-                <span style="margin-left:0.6rem; opacity:0.85; font-size:0.9rem;">{user_badge}</span>
+                <span style="font-size:1.4rem; font-weight:800; color:#0f172a;">🚴‍♂️ AI Cycling Coach Pro</span>
+                <span style="margin-left:0.65rem; color:#0369a1; font-weight:700; font-size:0.92rem; background:#ffffff; padding:0.2rem 0.6rem; border-radius:6px; border:1px solid #bae6fd;">{user_badge}</span>
             </div>
             <div>
                 <span class="status-pill">🏆 {race_name} まであと {days_to_race}日</span>
