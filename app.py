@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import os
 import re
+import hashlib
 import statistics
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -17,12 +18,14 @@ import time
 CONFIG_FILE = "config.json"
 CACHE_FILE = "intervals_cache.json"
 MEMORY_FILE = "coach_memory.json"
+USER_DATA_DIR = "user_data"
 
 # ==========================================
-# 0. 設定・キャッシュ・AI記憶の自動保存マネージャー
+# 0. 設定・キャッシュ・AI記憶の自動保存マネージャー（マルチユーザー＆オーナー自動ログイン対応）
 # ==========================================
 DEFAULT_CONFIG = {
     "athlete_id": "",
+    "athlete_name": "",
     "intervals_key": "",
     "gemini_key": "",
     "model": "gemini-3.8-flash",
@@ -39,6 +42,8 @@ DEFAULT_CONFIG = {
     "ext_status": "なし（通常通り）",
     "ext_detail": "",
     "ext_intensity_cap": "制限なし（コンディションに応じる）",
+    # 公開設定（Trueにすると通常URLアクセス時はゲストAPI入力画面をデフォルトにする）
+    "public_default_guest": False,
 }
 
 DEFAULT_MEMORY = {
@@ -51,7 +56,41 @@ DEFAULT_MEMORY = {
 }
 
 
-def load_config() -> dict:
+def compute_user_uid(intervals_key: str, athlete_id: str = "") -> str:
+    """他ユーザーのAPIキーから固有の識別ハッシュ（16文字）を生成（本人のみアクセス可能）"""
+    if not intervals_key or not intervals_key.strip():
+        return ""
+    raw = f"icu_user:{intervals_key.strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def get_active_file_paths() -> tuple[str, str, str]:
+    """現在のセッションモード（owner または guest）に応じた (config_path, cache_path, memory_path) を返す"""
+    mode = st.session_state.get("user_mode", "owner")
+    if mode == "owner":
+        return CONFIG_FILE, CACHE_FILE, MEMORY_FILE
+    uid = st.session_state.get("guest_uid", "")
+    if not uid:
+        return "", "", ""
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    safe_uid = re.sub(r"[^a-zA-Z0-9_-]", "", uid)[:32]
+    return (
+        os.path.join(USER_DATA_DIR, f"user_{safe_uid}_config.json"),
+        os.path.join(USER_DATA_DIR, f"user_{safe_uid}_cache.json"),
+        os.path.join(USER_DATA_DIR, f"user_{safe_uid}_memory.json"),
+    )
+
+
+def _normalize_model_name(config: dict) -> dict:
+    if config.get("model") in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]:
+        config["model"] = "gemini-3.8-flash"
+    elif config.get("model") in ["gemini-2.5-pro", "gemini-1.5-pro"]:
+        config["model"] = "gemini-3.1-pro"
+    return config
+
+
+def load_owner_config() -> dict:
+    """オーナー（自分）専用の設定を config.json および st.secrets から読み込む"""
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         try:
@@ -66,29 +105,73 @@ def load_config() -> dict:
                 config[k] = st.secrets[k]
     except Exception:
         pass
-    # 非推奨・終了モデルの自動移行
-    if config.get("model") in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]:
-        config["model"] = "gemini-3.8-flash"
-    elif config.get("model") in ["gemini-2.5-pro", "gemini-1.5-pro"]:
-        config["model"] = "gemini-3.1-pro"
-    return config
+    return _normalize_model_name(config)
+
+
+def load_config() -> dict:
+    """現在のログインユーザー（オーナー または ゲスト）の設定を読み込む"""
+    mode = st.session_state.get("user_mode", "owner")
+    if mode == "owner":
+        return load_owner_config()
+
+    # ゲスト（他の人）モードの場合：オーナーのキーや設定は一切読み込まない
+    config = DEFAULT_CONFIG.copy()
+    if "guest_config" in st.session_state and isinstance(st.session_state.guest_config, dict):
+        config.update(st.session_state.guest_config)
+
+    cfg_path, _, _ = get_active_file_paths()
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                # セッション内で未入力の項目があればファイルから復元
+                for k, v in saved.items():
+                    if not config.get(k) or k not in st.session_state.get("guest_config", {}):
+                        config[k] = v
+        except Exception:
+            pass
+    return _normalize_model_name(config)
 
 
 def save_config(new_config: dict):
+    """現在のログインユーザーの設定を保存する（ゲストの場合はオーナーのconfig.jsonを上書きしない）"""
+    mode = st.session_state.get("user_mode", "owner")
+    if mode != "owner":
+        st.session_state.guest_config = new_config.copy()
+        uid = compute_user_uid(new_config.get("intervals_key", ""), new_config.get("athlete_id", ""))
+        if uid:
+            st.session_state.guest_uid = uid
+            try:
+                st.query_params["mode"] = "guest"
+                st.query_params["uid"] = uid
+            except Exception:
+                pass
+
+    cfg_path, _, _ = get_active_file_paths()
+    if not cfg_path:
+        return
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(new_config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.warning(f"設定ファイルの保存に失敗しました（クラウド環境の場合は正常です）: {e}")
+    except Exception:
+        pass
 
 
 def load_memory() -> dict:
-    mem = DEFAULT_MEMORY.copy()
-    if os.path.exists(MEMORY_FILE):
+    mem = {
+        "messages": [],
+        "generated_workout": None,
+        "daily_workout_history": [],
+        "weekly_plan": None,
+        "weekly_plan_history": [],
+        "ride_reviews": {},
+    }
+    _, _, mem_path = get_active_file_paths()
+    if mem_path and os.path.exists(mem_path):
         try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            with open(mem_path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                for k in DEFAULT_MEMORY:
+                for k in mem:
                     if k in saved:
                         mem[k] = saved[k]
         except Exception:
@@ -97,17 +180,20 @@ def load_memory() -> dict:
 
 
 def save_memory():
-    """現在のst.session_state内の記憶データをファイルへ永続化"""
+    """現在のst.session_state内の記憶データを現在のユーザー専用ファイルへ永続化"""
+    _, _, mem_path = get_active_file_paths()
+    if not mem_path:
+        return
     try:
         mem_data = {
-            "messages": st.session_state.get("messages", [])[-60:],  # 直近60メッセージを保持
+            "messages": st.session_state.get("messages", [])[-60:],
             "generated_workout": st.session_state.get("generated_workout"),
             "daily_workout_history": st.session_state.get("daily_workout_history", [])[-20:],
             "weekly_plan": st.session_state.get("weekly_plan"),
             "weekly_plan_history": st.session_state.get("weekly_plan_history", [])[-10:],
             "ride_reviews": st.session_state.get("ride_reviews", {}),
         }
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        with open(mem_path, "w", encoding="utf-8") as f:
             json.dump(mem_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -115,6 +201,9 @@ def save_memory():
 
 def save_metrics_cache(metrics: dict):
     if not metrics:
+        return
+    _, cache_path, _ = get_active_file_paths()
+    if not cache_path:
         return
     try:
         data = {
@@ -128,16 +217,17 @@ def save_metrics_cache(metrics: dict):
             "pdc": metrics.get("pdc", {}),
             "cached_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
 def load_metrics_cache():
-    if os.path.exists(CACHE_FILE):
+    _, cache_path, _ = get_active_file_paths()
+    if cache_path and os.path.exists(cache_path):
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             act_list = data.get("activities", [])
             data["activities_df"] = pd.DataFrame(act_list).drop(columns=["id"], errors="ignore") if act_list else pd.DataFrame()
@@ -145,6 +235,18 @@ def load_metrics_cache():
         except Exception:
             pass
     return None
+
+
+def reload_user_session_data():
+    """ユーザー切り替え時に、現在のユーザー用のキャッシュと記憶をセッションに再ロードする"""
+    mem = load_memory()
+    st.session_state.metrics = load_metrics_cache()
+    st.session_state.messages = mem.get("messages", [])
+    st.session_state.generated_workout = mem.get("generated_workout")
+    st.session_state.daily_workout_history = mem.get("daily_workout_history", [])
+    st.session_state.weekly_plan = mem.get("weekly_plan")
+    st.session_state.weekly_plan_history = mem.get("weekly_plan_history", [])
+    st.session_state.ride_reviews = mem.get("ride_reviews", {})
 
 
 # ==========================================
@@ -175,8 +277,34 @@ class IntervalsClient:
     BASE_URL = "https://intervals.icu/api/v1"
 
     def __init__(self, athlete_id: str, api_key: str):
-        self.athlete_id = athlete_id.strip()
+        cleaned_id = athlete_id.strip() if athlete_id else ""
+        self.athlete_id = cleaned_id if cleaned_id else "0"
         self.auth = ("API_KEY", api_key.strip())
+
+    def get_athlete_profile(self) -> dict:
+        """Intervals.icuからアスリートID・氏名・体重・FTPを自動取得"""
+        url = f"{self.BASE_URL}/athlete/{self.athlete_id}"
+        res = requests.get(url, auth=self.auth, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        resolved_id = str(data.get("id") or self.athlete_id or "")
+        name = str(data.get("name") or "")
+        weight = data.get("icu_weight") or data.get("weight")
+        ftp = None
+        for s in data.get("sportSettings", []):
+            types_list = s.get("types") or []
+            if "Ride" in types_list or "VirtualRide" in types_list:
+                ftp = s.get("ftp") or s.get("indoor_ftp")
+                if ftp:
+                    break
+        if not ftp:
+            ftp = data.get("ftp") or data.get("icu_ftp")
+        return {
+            "athlete_id": resolved_id,
+            "name": name,
+            "weight": float(weight) if weight else None,
+            "ftp": int(ftp) if ftp else None,
+        }
 
     def get_wellness(self, days: int = 40) -> list:
         end_date = datetime.now().strftime("%Y-%m-%d")
@@ -212,6 +340,7 @@ class IntervalsClient:
         res = requests.post(url, auth=self.auth, json=payload, timeout=10)
         res.raise_for_status()
         return res.json()
+
 
     def get_activity_segments(self, activity_id: str) -> list:
         """Stravaセグメント一覧と各セグメントのタイム・パワー・心拍を算出"""
@@ -1089,7 +1218,28 @@ st.markdown("""
 
 st.title("🚴‍♂️ AI Cycling Coach")
 
-# 設定とAI記憶のロード
+# --- マルチユーザー & オーナー自動ログイン判定 ---
+owner_cfg = load_owner_config()
+q_mode = st.query_params.get("mode", "")
+q_uid = st.query_params.get("uid", "")
+
+if "user_mode" not in st.session_state:
+    if q_mode == "guest" or q_uid:
+        st.session_state.user_mode = "guest"
+        if q_uid:
+            st.session_state.guest_uid = q_uid
+    elif q_mode == "owner":
+        st.session_state.user_mode = "owner"
+    else:
+        # オーナーが「通常URLをゲスト画面にする」をONにしている場合以外は、今まで通りオーナー自動ログイン
+        if owner_cfg.get("public_default_guest", False) or not owner_cfg.get("intervals_key"):
+            st.session_state.user_mode = "guest"
+        else:
+            st.session_state.user_mode = "owner"
+
+is_owner_mode = (st.session_state.user_mode == "owner")
+
+# 設定とAI記憶のロード（現在のユーザー専用領域から読み込み）
 cfg = load_config()
 mem = load_memory()
 
@@ -1108,14 +1258,110 @@ if "weekly_plan_history" not in st.session_state:
 if "ride_reviews" not in st.session_state:
     st.session_state.ride_reviews = mem.get("ride_reviews", {})
 
-# --- サイドバー：設定入力 ＆ 外的要因 ＆ 自動保存 ---
+# --- サイドバー：ユーザー切替・設定入力・外的要因・自動保存 ---
 with st.sidebar:
-    st.header("⚙️ 設定 & 自動保存")
-    st.caption("一度保存すれば次回から入力不要です。")
+    st.header("👤 アカウント & モード切替")
+    if is_owner_mode:
+        st.success(f"👑 オーナー自動ログイン中 ({cfg.get('athlete_id') or '設定済'})")
+        if st.button("👥 他の人が使う（別アカウント / API入力）", use_container_width=True):
+            st.session_state.user_mode = "guest"
+            st.session_state.guest_uid = ""
+            st.session_state.guest_config = {}
+            try:
+                st.query_params["mode"] = "guest"
+                if "uid" in st.query_params:
+                    del st.query_params["uid"]
+            except Exception:
+                pass
+            reload_user_session_data()
+            st.rerun()
 
-    athlete_id = st.text_input("Intervals Athlete ID", value=cfg.get("athlete_id", ""), placeholder="例: i123456")
-    intervals_key = st.text_input("Intervals API Key", value=cfg.get("intervals_key", ""), type="password")
-    gemini_key = st.text_input("Gemini API Key", value=cfg.get("gemini_key", ""), type="password")
+        with st.expander("🔗 他の人へのアプリ共有・公開設定"):
+            st.caption("友人に共有する際は、URLの末尾に `?mode=guest` を付けて送ると、最初からAPI入力画面が開きます。")
+            st.code("https://ai-cycling-coach-ps662nnyskxx8krt7w7rnj.streamlit.app/?mode=guest", language="text")
+            pub_default = st.checkbox(
+                "🔒 通常URL（パラメータなし）もゲストAPI入力画面にする",
+                value=bool(cfg.get("public_default_guest", False)),
+                help="ONにすると、通常のURLを開いた時は全員『API入力画面』になり、あなた自身は ?mode=owner のブックマークURLで自動ログインできるようになります。"
+            )
+            if pub_default != bool(cfg.get("public_default_guest", False)):
+                cfg["public_default_guest"] = pub_default
+                save_config(cfg)
+                st.success("公開デフォルト設定を更新しました！")
+                if pub_default:
+                    st.info("💡 あなた専用の自動ログインURL: 末尾に `?mode=owner` を付けてブックマークしてください。")
+    else:
+        pub_default = bool(owner_cfg.get("public_default_guest", False))
+        if cfg.get("intervals_key") and cfg.get("gemini_key"):
+            st.info(f"🚴 ゲスト利用中 (ID: {cfg.get('athlete_id') or '自動取得'})")
+            if st.session_state.get("guest_uid"):
+                st.caption("💡 現在のURL（`?mode=guest&uid=...`）をブックマークすると、次回もあなたの設定と記憶で自動ログインできます。")
+            if st.button("🚪 ログアウト / 別のAPIキーを入力", use_container_width=True):
+                st.session_state.guest_uid = ""
+                st.session_state.guest_config = {}
+                try:
+                    st.query_params["mode"] = "guest"
+                    if "uid" in st.query_params:
+                        del st.query_params["uid"]
+                except Exception:
+                    pass
+                reload_user_session_data()
+                st.rerun()
+        else:
+            st.warning("🔑 未ログイン（APIキーを入力してください）")
+
+        if owner_cfg.get("intervals_key"):
+            if not pub_default:
+                if st.button("👑 オーナー（自分）の自動ログインに戻る", use_container_width=True):
+                    st.session_state.user_mode = "owner"
+                    try:
+                        st.query_params["mode"] = "owner"
+                        if "uid" in st.query_params:
+                            del st.query_params["uid"]
+                    except Exception:
+                        pass
+                    reload_user_session_data()
+                    st.rerun()
+            else:
+                with st.expander("👑 オーナー（管理者）ログイン"):
+                    owner_pin = st.text_input("オーナー Athlete ID を入力", placeholder="例: i123456")
+                    if st.button("オーナーとして自動ログイン", use_container_width=True):
+                        if owner_pin.strip() == owner_cfg.get("athlete_id", "").strip():
+                            st.session_state.user_mode = "owner"
+                            try:
+                                st.query_params["mode"] = "owner"
+                                if "uid" in st.query_params:
+                                    del st.query_params["uid"]
+                            except Exception:
+                                pass
+                            reload_user_session_data()
+                            st.rerun()
+                        else:
+                            st.error("Athlete ID が一致しません。")
+
+    st.divider()
+    st.header("⚙️ API & モデル設定")
+
+    if is_owner_mode:
+        # オーナーモードでは既存のAPIキー文字列を画面のinput valueに直接出さず保護する
+        athlete_id = cfg.get("athlete_id", "")
+        intervals_key = cfg.get("intervals_key", "")
+        gemini_key = cfg.get("gemini_key", "")
+        with st.expander("🔑 オーナーAPIキーの変更（通常は変更不要）"):
+            st.caption("セキュリティ保護のため現在のキーは非表示です。変更する場合のみ入力してください。")
+            new_aid = st.text_input("Intervals Athlete ID", value=athlete_id, placeholder="例: i123456")
+            new_ikey = st.text_input("新しい Intervals API Key", value="", type="password", placeholder="変更しない場合は空欄")
+            new_gkey = st.text_input("新しい Gemini API Key", value="", type="password", placeholder="変更しない場合は空欄")
+            if new_aid.strip():
+                athlete_id = new_aid.strip()
+            if new_ikey.strip():
+                intervals_key = new_ikey.strip()
+            if new_gkey.strip():
+                gemini_key = new_gkey.strip()
+    else:
+        athlete_id = st.text_input("Intervals Athlete ID (空欄でも自動取得)", value=cfg.get("athlete_id", ""), placeholder="例: i123456")
+        intervals_key = st.text_input("Intervals API Key", value=cfg.get("intervals_key", ""), type="password")
+        gemini_key = st.text_input("Gemini API Key", value=cfg.get("gemini_key", ""), type="password")
 
     model_options = [
         "gemini-3.8-flash",
@@ -1202,6 +1448,7 @@ with st.sidebar:
 
     current_cfg_dict = {
         "athlete_id": athlete_id,
+        "athlete_name": cfg.get("athlete_name", ""),
         "intervals_key": intervals_key,
         "gemini_key": gemini_key,
         "model": selected_model,
@@ -1217,11 +1464,12 @@ with st.sidebar:
         "ext_status": ext_status,
         "ext_detail": ext_detail,
         "ext_intensity_cap": ext_intensity_cap,
+        "public_default_guest": pub_default,
     }
 
     if st.button("💾 設定を保存する", use_container_width=True):
         save_config(current_cfg_dict)
-        st.success("設定を config.json に保存しました！")
+        st.success("✅ 設定を保存しました！")
 
     st.divider()
     with st.expander("🧠 記憶データのバックアップ / 管理"):
@@ -1264,6 +1512,107 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"復元エラー: {e}")
 
+# --- ゲスト（他の人）が未ログインの場合：メイン画面に分かりやすいAPI入力＆初期設定フォームを表示 ---
+if not is_owner_mode and (not intervals_key or not gemini_key):
+    st.info("👋 **AI Cycling Coach へようこそ！** ご自身の Intervals.icu API Key と Gemini API Key を入力して利用を開始できます。（入力したデータは他のユーザーとは完全に分離して処理されます）")
+
+    with st.expander("📖 APIキーの取得方法（初回のみ・約1分）", expanded=True):
+        st.markdown("""
+1. **Intervals.icu API Key の取得**
+   - **[Intervals.icu の設定ページ (Settings)](https://intervals.icu/settings)** を開きます。
+   - ページ下部にある **「Developer Settings」** セクションの **「API Key」**（「View」または生成ボタン）をコピーします。
+   - ※ Athlete ID（`i123456` 等）は空欄のままでもAPIキーから自動認識されます。
+2. **Google Gemini API Key の取得（無料枠で利用可能）**
+   - **[Google AI Studio (API Keys)](https://aistudio.google.com/app/apikey)** にGoogleアカウントでログインします。
+   - **「Create API key」** を押して発行されたキーをコピーします。
+        """)
+
+    with st.form("guest_onboarding_form"):
+        st.subheader("🔑 APIキーと基本目標の入力")
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            in_intervals_key = st.text_input("1️⃣ Intervals.icu API Key (必須)", type="password", placeholder="Intervals.icu の API Key を貼り付け")
+            in_athlete_id = st.text_input("Intervals Athlete ID (任意・空欄で自動取得)", placeholder="例: i123456（空欄でもOK）")
+        with f_col2:
+            in_gemini_key = st.text_input("2️⃣ Gemini API Key (必須)", type="password", placeholder="AIza... または AQ... から始まるキー")
+            auto_fetch_phys = st.checkbox("✅ 現在のFTPと体重を Intervals.icu から自動取得する", value=True)
+
+        st.markdown("##### 🏆 目標レース・フィジカル設定（後からサイドバーでいつでも変更可能）")
+        g_col1, g_col2, g_col3 = st.columns(3)
+        with g_col1:
+            in_ftp = st.number_input("現在のFTP (W) ※自動取得時は上書きされます", 100, 500, 250, 5)
+            in_weight = st.number_input("現在の体重 (kg) ※自動取得時は上書きされます", 35.0, 120.0, 60.0, 0.5)
+        with g_col2:
+            in_target_ftp = st.number_input("目標FTP (W)", 100, 550, 280, 5)
+            in_race_name = st.text_input("目標レース名 / イベント名", value="Mt.富士ヒルクライム")
+        with g_col3:
+            in_race_date = st.date_input("目標開催日", value=datetime.now().date() + timedelta(days=60))
+            in_race_type = st.selectbox("レース特性", race_options)
+
+        submitted_login = st.form_submit_button("🚀 このAPIキーでログインしてデータ同期を開始", type="primary", use_container_width=True)
+
+    if submitted_login:
+        if not in_intervals_key.strip() or not in_gemini_key.strip():
+            st.error("⚠️ Intervals.icu API Key と Gemini API Key の両方を入力してください。")
+        else:
+            try:
+                with st.spinner("Intervals.icu に接続し、プロフィールと最新データを取得中..."):
+                    temp_client = IntervalsClient(in_athlete_id.strip(), in_intervals_key.strip())
+                    prof = temp_client.get_athlete_profile()
+                    resolved_id = prof.get("athlete_id") or in_athlete_id.strip() or "0"
+                    resolved_name = prof.get("name") or ""
+                    resolved_ftp = prof.get("ftp") if (auto_fetch_phys and prof.get("ftp")) else int(in_ftp)
+                    resolved_weight = prof.get("weight") if (auto_fetch_phys and prof.get("weight")) else float(in_weight)
+
+                    # このユーザー固有のUIDをセットし、以前に保存された記憶があればロード
+                    uid = compute_user_uid(in_intervals_key.strip(), resolved_id)
+                    st.session_state.guest_uid = uid
+                    reload_user_session_data()
+
+                    new_guest_cfg = current_cfg_dict.copy()
+                    new_guest_cfg.update({
+                        "athlete_id": resolved_id,
+                        "athlete_name": resolved_name,
+                        "intervals_key": in_intervals_key.strip(),
+                        "gemini_key": in_gemini_key.strip(),
+                        "ftp": resolved_ftp,
+                        "weight": resolved_weight,
+                        "target_ftp": int(in_target_ftp),
+                        "race_name": in_race_name,
+                        "race_date": in_race_date.strftime("%Y-%m-%d"),
+                        "race_type": in_race_type,
+                    })
+                    save_config(new_guest_cfg)
+
+                    # データ同期実行
+                    authed_client = IntervalsClient(resolved_id, in_intervals_key.strip())
+                    wellness = authed_client.get_wellness(days=40)
+                    activities = authed_client.get_activities(days=40)
+                    pdc_raw = authed_client.get_power_curves(curves="1y")
+                    st.session_state.metrics = parse_intervals_data(wellness, activities, pdc_raw, resolved_weight, resolved_ftp)
+                    save_metrics_cache(st.session_state.metrics)
+
+                st.success(f"✅ ログイン成功！（Athlete ID: {resolved_id} / FTP: {resolved_ftp}W / 体重: {resolved_weight}kg）")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 接続エラー: APIキーまたはAthlete IDをご確認ください。（詳細: {e}）")
+
+    # オーナー自身がゲスト画面を確認している場合にワンクリックで戻れるボタン
+    if owner_cfg.get("intervals_key") and not bool(owner_cfg.get("public_default_guest", False)):
+        st.divider()
+        if st.button("👑 オーナー（自分）の自動ログイン画面に戻る"):
+            st.session_state.user_mode = "owner"
+            try:
+                st.query_params["mode"] = "owner"
+                if "uid" in st.query_params:
+                    del st.query_params["uid"]
+            except Exception:
+                pass
+            reload_user_session_data()
+            st.rerun()
+
+    st.stop()
+
 profile_data = {
     "ftp": ftp,
     "weight": weight,
@@ -1281,14 +1630,24 @@ profile_data = {
 
 
 def sync_intervals_now(show_msg=True):
-    if not athlete_id or not intervals_key:
+    global athlete_id
+    if not intervals_key:
         if show_msg:
-            st.warning("左上の「＞」からサイドバーを開き、Athlete IDとAPI Keyを入力・保存してください。")
+            st.warning("左上の「＞」からサイドバーを開き、Intervals API Keyを入力・保存してください。")
         return
     try:
         with st.spinner("Intervals.icuから最新データ（HRV・睡眠・PDC・履歴）を取得中..."):
-            save_config(current_cfg_dict)
             client = IntervalsClient(athlete_id, intervals_key)
+            if not athlete_id or athlete_id == "0":
+                try:
+                    prof = client.get_athlete_profile()
+                    if prof.get("athlete_id"):
+                        athlete_id = prof["athlete_id"]
+                        current_cfg_dict["athlete_id"] = athlete_id
+                        client = IntervalsClient(athlete_id, intervals_key)
+                except Exception:
+                    pass
+            save_config(current_cfg_dict)
             wellness = client.get_wellness(days=40)
             activities = client.get_activities(days=40)
             pdc_raw = client.get_power_curves(curves="1y")
@@ -1315,17 +1674,45 @@ def sync_intervals_now(show_msg=True):
                 st.info(f"ℹ️ 前回の同期キャッシュデータ（{cached.get('cached_at', '以前')} 取得分）を自動適用しました。")
 
 # 初回起動時（またはキャッシュにwellness_readinessがない場合）に自動同期
-if (st.session_state.metrics is None or "wellness_readiness" not in st.session_state.metrics) and athlete_id and intervals_key:
+if (st.session_state.metrics is None or "wellness_readiness" not in st.session_state.metrics) and intervals_key:
     sync_intervals_now(show_msg=False)
 
-# --- メイン画面上部：ワンタップ同期ボタン & コンディション指標 ---
-top_col1, top_col2 = st.columns([3, 1])
+# --- メイン画面上部：ワンタップ同期ボタン & ユーザー切替ボタン & コンディション指標 ---
+top_col1, top_col2, top_col3 = st.columns([3.2, 1, 1])
 with top_col1:
     days_to_race = (race_date - datetime.now().date()).days
-    st.markdown(f"**🏆 目標: {race_name}** （残り **{days_to_race}日** / {determine_training_phase(days_to_race)}） ｜ 🤖 `{selected_model}`")
+    user_badge = f"👑 オーナー ({athlete_id})" if is_owner_mode else f"👤 ゲスト ({athlete_id or 'User'})"
+    st.markdown(f"**🏆 目標: {race_name}** （残り **{days_to_race}日** / {determine_training_phase(days_to_race)}） ｜ {user_badge} ｜ 🤖 `{selected_model}`")
 with top_col2:
     if st.button("🔄 最新データを再同期", use_container_width=True):
         sync_intervals_now(show_msg=True)
+with top_col3:
+    if is_owner_mode:
+        if st.button("👥 他ユーザー利用へ切替", use_container_width=True, help="他の人が自分のAPIキーを入力して使う画面へ切り替えます"):
+            st.session_state.user_mode = "guest"
+            st.session_state.guest_uid = ""
+            st.session_state.guest_config = {}
+            try:
+                st.query_params["mode"] = "guest"
+                if "uid" in st.query_params:
+                    del st.query_params["uid"]
+            except Exception:
+                pass
+            reload_user_session_data()
+            st.rerun()
+    else:
+        if st.button("🚪 別API入力 / 切替", use_container_width=True, help="ログアウトしてAPIキー入力画面に戻ります"):
+            st.session_state.guest_uid = ""
+            st.session_state.guest_config = {}
+            try:
+                st.query_params["mode"] = "guest"
+                if "uid" in st.query_params:
+                    del st.query_params["uid"]
+            except Exception:
+                pass
+            reload_user_session_data()
+            st.rerun()
+
 
 # 外的要因（事故・病気・怪我等）が設定されている場合の警告バナー
 if ext_status != "なし（通常通り）" or ext_detail.strip() or ext_intensity_cap != "制限なし（コンディションに応じる）":
@@ -1607,8 +1994,8 @@ with tab_weekly:
 
         st.divider()
         if st.button("🚀 7日分のワークアウトをIntervals.icuカレンダーへ一括登録する", type="primary", use_container_width=True):
-            if not athlete_id or not intervals_key:
-                st.error("Athlete IDとAPI Keyを設定してください。")
+            if not intervals_key:
+                st.error("Intervals API Keyを設定してください。")
             else:
                 client = IntervalsClient(athlete_id, intervals_key)
                 posted_count = 0
@@ -1659,7 +2046,7 @@ with tab_debrief:
 
         # Stravaセグメントログの取得と表示
         current_segments = []
-        if act_id and athlete_id and intervals_key:
+        if act_id and intervals_key:
             cache_key = f"segments_{act_id}"
             if cache_key not in st.session_state:
                 client = IntervalsClient(athlete_id, intervals_key)
