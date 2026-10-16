@@ -1569,7 +1569,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.1rem; padding-bottom: 2.5rem; max-width: 1320px; }
+    .block-container { padding-top: 3.8rem !important; padding-bottom: 2.5rem !important; max-width: 1320px; }
 
     /* KPI メトリクスカード：純白背景＋ディープネイビー文字＋スカイブルー左アクセントで視認性を極限まで向上 */
     div[data-testid="stMetric"] {
@@ -2202,7 +2202,7 @@ gap_watts = target_ftp - ftp
 
 # --- コア・テレメトリー KPI メトリクス (5カラム) ---
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("⚡ 現在 PWR (FTP)", f"{current_pwr} W/kg", f"{ftp}W (目標 {target_pwr}W/kg / あと{gap_watts:+}W)")
+m1.metric("⚡ 現在 PWR (FTP)", f"{current_pwr} W/kg", f"{ftp}W → 目標{target_ftp}W ({gap_watts:+}W)")
 if st.session_state.metrics:
     ctl_v = st.session_state.metrics["ctl"]
     atl_v = st.session_state.metrics["atl"]
@@ -2210,12 +2210,13 @@ if st.session_state.metrics:
     ramp_v = st.session_state.metrics.get("ramp_rate", 0.0)
     ramp_status = "適正ビルド" if 2.0 <= ramp_v <= 6.0 else ("急上昇注意" if ramp_v > 6.0 else "維持/回復")
     m2.metric("📈 CTL (長期フィットネス)", ctl_v, f"Ramp: {ramp_v:+} /週 ({ramp_status})")
-    m3.metric("🔥 ATL (短期疲労)", atl_v)
+    atl_status = "高負荷期" if atl_v > ctl_v + 5 else ("回復傾向" if atl_v < ctl_v - 5 else "CTLと均衡")
+    m3.metric("🔥 ATL (短期疲労)", atl_v, atl_status)
     tsb_status = "フレッシュ (好調)" if tsb_v > 5 else ("最適鍛錬ゾーン" if tsb_v >= -20 else "過疲労警戒")
     m4.metric("⚖️ TSB (フォーム/余力)", tsb_v, tsb_status)
     wr_quick = st.session_state.metrics.get("wellness_readiness", {})
     r_score = wr_quick.get("score", "--")
-    r_lbl = wr_quick.get("status_label", "未取得").split(" ")[0]
+    r_lbl = wr_quick.get("status_label", "未取得").split(" (")[0]
     m5.metric("🫀 本日のReadiness", f"{r_score} / 100", r_lbl)
 else:
     m2.metric("📈 CTL", "--")
