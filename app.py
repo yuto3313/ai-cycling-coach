@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
     "athlete_name": "",
     "intervals_key": "",
     "gemini_key": "",
+    "sarashina_key": "",
     "model": "gemini-3.8-flash",
     "ftp": 280,
     "weight": 60.0,
@@ -109,7 +110,7 @@ def load_owner_config() -> dict:
         except Exception:
             pass
     try:
-        for k in ["athlete_id", "intervals_key", "gemini_key"]:
+        for k in ["athlete_id", "intervals_key", "gemini_key", "sarashina_key"]:
             if not config.get(k) and k in st.secrets:
                 config[k] = st.secrets[k]
     except Exception:
@@ -1462,46 +1463,147 @@ Cooldown
 """
 
 
-def get_candidate_models(primary_model: str) -> list[str]:
-    """クォータ制限時のフォールバック順序リストを生成"""
-    defaults = ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-4-argon", "gemini-2.0-flash"]
-    candidates = [primary_model] if primary_model else []
-    for m in defaults:
-        if m not in candidates:
-            candidates.append(m)
+SARASHINA_API_URL = "https://api.sarashina.ai/v1/chat/completions"
+
+
+def is_sarashina_model(model_name: str) -> bool:
+    """モデル名が Sarashina AI 系かどうかを判定"""
+    return "sarashina" in (model_name or "").lower()
+
+
+def _contents_to_openai_messages(contents, sys_prompt: str) -> list[dict]:
+    """文字列または Gemini Content 配列を OpenAI / Sarashina 互換の messages 配列へ変換"""
+    messages = []
+    if sys_prompt:
+        messages.append({"role": "system", "content": sys_prompt})
+
+    if isinstance(contents, str):
+        messages.append({"role": "user", "content": contents})
+    elif isinstance(contents, list):
+        for item in contents:
+            if isinstance(item, dict):
+                role = "assistant" if item.get("role") in ["assistant", "model"] else "user"
+                messages.append({"role": role, "content": str(item.get("content", ""))})
+            else:
+                # google.genai.types.Content オブジェクトの場合
+                role_raw = getattr(item, "role", "user")
+                role = "assistant" if role_raw in ["assistant", "model"] else "user"
+                parts = getattr(item, "parts", []) or []
+                text_pieces = [getattr(p, "text", "") for p in parts if getattr(p, "text", None)]
+                messages.append({"role": role, "content": "\n".join(text_pieces)})
+    else:
+        messages.append({"role": "user", "content": str(contents)})
+    return messages
+
+
+def call_sarashina_chat(sarashina_key: str, model_name: str, contents, sys_prompt: str) -> str:
+    """Sarashina API (OpenAI互換 Chat Completions) を呼び出して応答テキストを返す"""
+    if not sarashina_key or not sarashina_key.strip():
+        raise ValueError("Sarashina API Key が未設定です。サイドバーで Sarashina API Key を入力・保存してください。")
+
+    headers = {
+        "Authorization": f"Bearer {sarashina_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    messages = _contents_to_openai_messages(contents, sys_prompt)
+    # Sarashina API は未知フィールドに対して厳格なため model と messages のみを送信
+    payload = {
+        "model": model_name.strip(),
+        "messages": messages,
+    }
+    res = requests.post(SARASHINA_API_URL, headers=headers, json=payload, timeout=90)
+    if res.status_code != 200:
+        raise RuntimeError(f"Sarashina API Error ({res.status_code}): {res.text}")
+    data = res.json()
+    choices = data.get("choices", [])
+    if not choices:
+        raise RuntimeError(f"Sarashina API から空の応答が返されました: {data}")
+    return choices[0].get("message", {}).get("content", "")
+
+
+def _extract_json_str(raw_text: str) -> str:
+    """Markdownの ```json ... ``` ブロックや前後の説明文から純粋なJSON文字列を抽出"""
+    s = raw_text.strip()
+    m_fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
+    if m_fence:
+        return m_fence.group(1).strip()
+    m_brace = re.search(r"(\{.*\})", s, re.DOTALL)
+    if m_brace:
+        return m_brace.group(1).strip()
+    return s
+
+
+def get_candidate_models(primary_model: str, gemini_key: str = "", sarashina_key: str = "") -> list[str]:
+    """選択モデルを最優先にしつつ、クォータ制限時のフォールバック順序リスト（Sarashina & Gemini 両対応）を生成"""
+    gemini_defaults = ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-4-argon", "gemini-2.0-flash"]
+    sarashina_defaults = ["sarashina3-mini", "sarashina3-nano"]
+
+    candidates = []
+    if primary_model:
+        candidates.append(primary_model)
+
+    if is_sarashina_model(primary_model):
+        for m in sarashina_defaults:
+            if m not in candidates and sarashina_key:
+                candidates.append(m)
+        for m in gemini_defaults:
+            if m not in candidates and gemini_key:
+                candidates.append(m)
+    else:
+        for m in gemini_defaults:
+            if m not in candidates and gemini_key:
+                candidates.append(m)
+        for m in sarashina_defaults:
+            if m not in candidates and sarashina_key:
+                candidates.append(m)
+
+    if not candidates:
+        candidates = [primary_model or "gemini-3.8-flash"]
     return candidates
 
 
-def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str):
-    """指定モデルが429や503、404の場合、制限のない代替モデルへ自動フォールバックしてストリーミング生成"""
-    candidates = get_candidate_models(model_name)
+def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str, sarashina_key: str = "", gemini_key: str = ""):
+    """Gemini および Sarashina AI 対応：429/503/404発生時は利用可能な別モデルへ自動フォールバックして生成"""
+    candidates = get_candidate_models(model_name, gemini_key=gemini_key, sarashina_key=sarashina_key)
     last_err = None
 
     for current_m in candidates:
         for attempt in range(2):
             try:
-                response_stream = client_ai.models.generate_content_stream(
-                    model=current_m,
-                    contents=contents,
-                    config=types.GenerateContentConfig(system_instruction=sys_prompt)
-                )
-                yielded = False
-                for chunk in response_stream:
-                    if not yielded and current_m != model_name:
-                        st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
-                    if chunk.text:
-                        yield chunk.text
-                        yielded = True
-                if yielded:
+                if is_sarashina_model(current_m):
+                    text_out = call_sarashina_chat(sarashina_key, current_m, contents, sys_prompt)
+                    if current_m != model_name:
+                        st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} (Sarashina AI) に切り替えました！")
+                    yield text_out
                     return
+                else:
+                    if client_ai is None:
+                        if gemini_key:
+                            client_ai = genai.Client(api_key=gemini_key)
+                        else:
+                            raise ValueError("Gemini API Key が未設定です。")
+                    response_stream = client_ai.models.generate_content_stream(
+                        model=current_m,
+                        contents=contents,
+                        config=types.GenerateContentConfig(system_instruction=sys_prompt)
+                    )
+                    yielded = False
+                    for chunk in response_stream:
+                        if not yielded and current_m != model_name:
+                            st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
+                        if chunk.text:
+                            yield chunk.text
+                            yielded = True
+                    if yielded:
+                        return
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"])
+                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded", "Rate limit"])
                 is_not_found = any(k in err_str for k in ["404", "NOT_FOUND"])
                 if is_quota or is_not_found:
                     break
-                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"])
+                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "502", "504"])
                 if is_busy and attempt < 1:
                     time.sleep(2)
                     continue
@@ -1512,30 +1614,71 @@ def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str
         raise last_err
 
 
-def generate_content_with_retry(client_ai, model_name: str, contents, config):
-    """通常生成（429クォータ上限時の自動モデルフォールバック対応）"""
-    candidates = get_candidate_models(model_name)
+class _SimpleTextResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
+def generate_content_with_retry(client_ai, model_name: str, contents, config, sarashina_key: str = "", gemini_key: str = "", sys_prompt: str = ""):
+    """構造化JSON生成（Gemini & Sarashina AI 両対応・429自動フォールバック付き）"""
+    candidates = get_candidate_models(model_name, gemini_key=gemini_key, sarashina_key=sarashina_key)
     last_err = None
+
+    json_schema_instruction = """
+
+【重要：出力フォーマット厳守】
+必ず以下のJSONスキーマ構造のみを純粋なJSON文字列として出力してください（前後の説明文は不要です）：
+{
+  "weekly_summary": "今週の全体方針・HRV/睡眠や外的要因への配慮・パワーカーブ弱点克服のアプローチ解説",
+  "days": [
+    {
+      "date": "YYYY-MM-DD",
+      "day_label": "月曜",
+      "is_rest_day": false,
+      "title": "ワークアウトのタイトル (休養日は 'Rest Day')",
+      "duration_min": 60,
+      "target_tss": 65,
+      "rationale": "この日のメニューの狙いとアドバイス",
+      "workout_code": "Warmup\\n- 10m 55%\\nMain Set 3x\\n- 8m 95%\\n- 4m 55%\\nCooldown\\n- 10m 50%"
+    }
+  ]
+}
+"""
 
     for current_m in candidates:
         for attempt in range(2):
             try:
-                res = client_ai.models.generate_content(
-                    model=current_m,
-                    contents=contents,
-                    config=config
-                )
-                if current_m != model_name:
-                    st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
-                return res
+                if is_sarashina_model(current_m):
+                    prompt_with_json = str(contents) + json_schema_instruction
+                    raw_res = call_sarashina_chat(sarashina_key, current_m, prompt_with_json, sys_prompt)
+                    clean_json = _extract_json_str(raw_res)
+                    # JSONとしてパースできるか検証
+                    json.loads(clean_json)
+                    if current_m != model_name:
+                        st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} (Sarashina AI) に切り替えました！")
+                    return _SimpleTextResponse(clean_json)
+                else:
+                    if client_ai is None:
+                        if gemini_key:
+                            client_ai = genai.Client(api_key=gemini_key)
+                        else:
+                            raise ValueError("Gemini API Key が未設定です。")
+                    res = client_ai.models.generate_content(
+                        model=current_m,
+                        contents=contents,
+                        config=config
+                    )
+                    if current_m != model_name:
+                        st.toast(f"🔄 {model_name} の制限に達したため、自動的に {current_m} に切り替えました！")
+                    return res
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"])
+                is_quota = any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded", "Rate limit"])
                 is_not_found = any(k in err_str for k in ["404", "NOT_FOUND"])
                 if is_quota or is_not_found:
                     break
-                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"])
+                is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "502", "504"])
                 if is_busy and attempt < 1:
                     time.sleep(2)
                     continue
@@ -1549,10 +1692,12 @@ def generate_content_with_retry(client_ai, model_name: str, contents, config):
 def show_ai_error(prefix: str, e: Exception, current_model: str):
     err_str = str(e)
     st.error(f"{prefix}: {err_str}")
-    if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded"]):
-        st.warning("⚠️ 利用可能な全AIモデル（3.8 Flash / 3.1 Pro / 4 Argon 等）の無料利用枠上限に達しました。Google AI Studio のリセット時刻をお待ちいただくか、有料プランの紐付けをご検討ください。")
+    if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "quota", "Quota exceeded", "Rate limit"]):
+        st.warning("⚠️ 利用可能なAIモデルの利用枠上限（レート制限）に達しました。サイドバーで別モデル（Sarashina AI / Gemini）へ切り替えるか、しばらく待ってから再試行してください。")
     elif any(k in err_str for k in ["503", "UNAVAILABLE", "high demand"]):
-        st.warning("⚠️ Googleのサーバーでアクセス集中（一時的な混雑）が発生しています。数秒待って再試行してください。")
+        st.warning("⚠️ AIサーバーでアクセス集中（一時的な混雑）が発生しています。数秒待って再試行してください。")
+    elif any(k in err_str for k in ["401", "403", "Unauthorized", "Invalid API"]):
+        st.warning("⚠️ APIキーが無効または未設定の可能性があります。サイドバーの「⚙️ API & AIモデル設定」でAPIキーをご確認ください。")
     elif any(k in err_str for k in ["404", "NOT_FOUND"]):
         st.warning("⚠️ 選択されたモデルが利用できない可能性があります。サイドバーのモデル設定をご確認ください。")
 
@@ -1772,7 +1917,7 @@ with st.sidebar:
     else:
         # ゲスト画面ではオーナー画面への切り替えボタン等を一切表示しない
         pub_default = bool(owner_cfg.get("public_default_guest", False))
-        if cfg.get("intervals_key") and cfg.get("gemini_key"):
+        if cfg.get("intervals_key") and (cfg.get("gemini_key") or cfg.get("sarashina_key")):
             st.info(f"🚴 ログイン中 (ID: {cfg.get('athlete_id') or '自動取得'})")
             if st.session_state.get("guest_uid"):
                 st.caption("💡 現在のURL（`?mode=guest&uid=...`）をブックマークすると次回から自動ログインできます。")
@@ -1797,41 +1942,56 @@ with st.sidebar:
         athlete_id = cfg.get("athlete_id", "")
         intervals_key = cfg.get("intervals_key", "")
         gemini_key = cfg.get("gemini_key", "")
-        with st.expander("🔑 オーナーAPIキーの変更（非表示保護中）"):
-            st.caption("セキュリティ保護のため現在のキーは非表示です。変更する場合のみ入力してください。")
+        sarashina_key = cfg.get("sarashina_key", "")
+        st.caption(
+            f"🔑 登録状態 — Gemini: **{'✅設定済' if gemini_key else '未設定'}** ／ Sarashina: **{'✅設定済' if sarashina_key else '未設定'}**"
+        )
+        with st.expander("🔑 オーナーAPIキーの登録・変更（非表示保護中）", expanded=(not sarashina_key)):
+            st.caption("セキュリティ保護のため保存済みキーは非表示です。新規登録または変更する項目のみ入力し、下の「💾 設定を保存する」を押してください。")
             new_aid = st.text_input("Intervals Athlete ID", value=athlete_id, placeholder="例: i123456")
             new_ikey = st.text_input("新しい Intervals API Key", value="", type="password", placeholder="変更しない場合は空欄")
             new_gkey = st.text_input("新しい Gemini API Key", value="", type="password", placeholder="変更しない場合は空欄")
+            new_skey = st.text_input("Sarashina AI API Key", value="", type="password", placeholder="hki_v1_... (未登録・変更時に入力)")
             if new_aid.strip():
                 athlete_id = new_aid.strip()
             if new_ikey.strip():
                 intervals_key = new_ikey.strip()
             if new_gkey.strip():
                 gemini_key = new_gkey.strip()
+            if new_skey.strip():
+                sarashina_key = new_skey.strip()
     else:
         athlete_id = st.text_input("Intervals Athlete ID (空欄で自動取得)", value=cfg.get("athlete_id", ""), placeholder="例: i123456")
         intervals_key = st.text_input("Intervals API Key", value=cfg.get("intervals_key", ""), type="password")
-        gemini_key = st.text_input("Gemini API Key", value=cfg.get("gemini_key", ""), type="password")
+        gemini_key = st.text_input("Gemini API Key (Gemini利用時)", value=cfg.get("gemini_key", ""), type="password")
+        sarashina_key = st.text_input("Sarashina AI API Key (Sarashina利用時)", value=cfg.get("sarashina_key", ""), type="password", placeholder="hki_v1_...")
 
     model_options = [
         "gemini-3.8-flash",
         "gemini-3.1-pro",
         "gemini-4-argon",
+        "sarashina3-mini",
+        "sarashina3-nano",
         "カスタム指定...",
     ]
     cur_model = cfg.get("model", "gemini-3.8-flash")
     idx_model = model_options.index(cur_model) if cur_model in model_options else (len(model_options) - 1 if cur_model else 0)
     selected_option = st.selectbox(
-        "🤖 AIモデル選択",
+        "🤖 AIモデル選択 (Gemini / Sarashina AI)",
         model_options,
         index=idx_model,
-        help="利用枠制限（429）に達した場合は自動で別モデルへ切り替わります。"
+        help="Google Gemini シリーズおよび SB Intuitions 国産LLM『Sarashina AI (sarashina3-mini / sarashina3-nano)』を選択できます。利用枠制限（429）時は設定済みの別モデルへ自動フォールバックします。"
     )
     if selected_option == "カスタム指定...":
-        custom_model = st.text_input("モデルIDを入力", value=cur_model if cur_model not in model_options else "gemini-3.8-flash")
+        custom_model = st.text_input("モデルIDを入力 (例: sarashina3-mini 等)", value=cur_model if cur_model not in model_options else "sarashina3-mini")
         selected_model = custom_model.strip()
     else:
         selected_model = selected_option
+
+    if is_sarashina_model(selected_model) and not sarashina_key:
+        st.warning("⚠️ Sarashina AI が選択されています。上の「Sarashina AI API Key」を入力し、下の「💾 設定を保存する」を押してください。")
+    elif not is_sarashina_model(selected_model) and not gemini_key:
+        st.warning("⚠️ Gemini モデルが選択されています。Gemini API Key を入力して保存してください。")
 
     st.divider()
     st.subheader("🏥 外的要因・怪我・病気の設定")
@@ -1894,6 +2054,7 @@ with st.sidebar:
         "athlete_name": cfg.get("athlete_name", ""),
         "intervals_key": intervals_key,
         "gemini_key": gemini_key,
+        "sarashina_key": sarashina_key,
         "model": selected_model,
         "ftp": ftp,
         "weight": weight,
@@ -1956,17 +2117,17 @@ with st.sidebar:
                     st.error(f"復元エラー: {e}")
 
 # --- ゲスト（他の人）が未ログインの場合：オーナー画面への導線を一切持たない専用ログイン画面を表示 ---
-if not is_owner_mode and (not intervals_key or not gemini_key):
+if not is_owner_mode and (not intervals_key or (not gemini_key and not sarashina_key)):
     st.markdown("""
     <div class="telemetry-banner">
         <h2 style="margin:0; font-size:1.6rem; color:#0f172a; font-weight:800;">🚴‍♂️ AI Cycling Coach Pro</h2>
         <p style="margin:0.35rem 0 0 0; color:#1e293b; font-weight:600; font-size:0.95rem;">
-            Intervals.icu の生理学データ（HRV・睡眠・CP/W'・Stravaセグメント）× Google Gemini AI によるパーソナル・ロードレースコーチングシステム
+            Intervals.icu の生理学データ（HRV・睡眠・CP/W'・Stravaセグメント）× Gemini / Sarashina AI によるパーソナル・ロードレースコーチングシステム
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.info("🔑 ご自身の **Intervals.icu API Key** と **Gemini API Key** を入力してログインしてください。入力されたデータ・記憶はあなた専用の暗号化領域に分離保存されます。")
+    st.info("🔑 ご自身の **Intervals.icu API Key** と、**Gemini API Key または Sarashina AI API Key**（両方設定も可）を入力してログインしてください。入力されたデータ・記憶はあなた専用の暗号化領域に分離保存されます。")
 
     with st.expander("📖 APIキーの取得方法（初回のみ・約1分）", expanded=True):
         st.markdown("""
@@ -1974,9 +2135,9 @@ if not is_owner_mode and (not intervals_key or not gemini_key):
    - **[Intervals.icu の設定ページ (Settings)](https://intervals.icu/settings)** を開きます。
    - ページ下部にある **「Developer Settings」** セクションの **「API Key」**（「View」または生成ボタン）をコピーします。
    - ※ Athlete ID（`i123456` 等）は空欄のままでもAPIキーから自動認識されます。
-2. **Google Gemini API Key の取得（無料枠で利用可能）**
-   - **[Google AI Studio (API Keys)](https://aistudio.google.com/app/apikey)** にGoogleアカウントでログインします。
-   - **「Create API key」** を押して発行されたキーをコピーします。
+2. **AI API Key の取得（Gemini または Sarashina AI のどちらか1つ以上でOK）**
+   - **Google Gemini API Key**: **[Google AI Studio (API Keys)](https://aistudio.google.com/app/apikey)** で「Create API key」を押して発行。
+   - **Sarashina AI API Key**: **SB Intuitions Sarashina API ポータル**から発行されたシークレットキー（`hki_v1_...`）をコピー。
         """)
 
     with st.form("guest_onboarding_form"):
@@ -1985,9 +2146,10 @@ if not is_owner_mode and (not intervals_key or not gemini_key):
         with f_col1:
             in_intervals_key = st.text_input("1️⃣ Intervals.icu API Key (必須)", type="password", placeholder="Intervals.icu の API Key を貼り付け")
             in_athlete_id = st.text_input("Intervals Athlete ID (任意・空欄で自動取得)", placeholder="例: i123456（空欄でも自動検出されます）")
-        with f_col2:
-            in_gemini_key = st.text_input("2️⃣ Gemini API Key (必須)", type="password", placeholder="AIza... または AQ... から始まるキー")
             auto_fetch_phys = st.checkbox("✅ 現在のFTPと体重を Intervals.icu から自動取得する", value=True)
+        with f_col2:
+            in_gemini_key = st.text_input("2️⃣-A Gemini API Key (Gemini利用時)", type="password", placeholder="AIza... から始まるキー")
+            in_sarashina_key = st.text_input("2️⃣-B Sarashina AI API Key (Sarashina利用時)", type="password", placeholder="hki_v1_... から始まるキー")
 
         st.markdown("##### 🏆 目標レース・フィジカル設定（ログイン後もサイドバーで変更可能）")
         g_col1, g_col2, g_col3 = st.columns(3)
@@ -2004,8 +2166,8 @@ if not is_owner_mode and (not intervals_key or not gemini_key):
         submitted_login = st.form_submit_button("⚡ ログインしてAIコーチングを開始", type="primary", use_container_width=True)
 
     if submitted_login:
-        if not in_intervals_key.strip() or not in_gemini_key.strip():
-            st.error("⚠️ Intervals.icu API Key と Gemini API Key の両方を入力してください。")
+        if not in_intervals_key.strip() or (not in_gemini_key.strip() and not in_sarashina_key.strip()):
+            st.error("⚠️ Intervals.icu API Key と、Gemini API Key または Sarashina AI API Key の少なくとも一方を入力してください。")
         else:
             # もし入力された Intervals API Key がオーナー本人の秘密キーと完全一致した場合はオーナーモードとして認証
             if owner_cfg.get("intervals_key") and in_intervals_key.strip() == owner_cfg.get("intervals_key", "").strip():
@@ -2033,12 +2195,15 @@ if not is_owner_mode and (not intervals_key or not gemini_key):
                     st.session_state.guest_uid = uid
                     reload_user_session_data()
 
+                    default_guest_model = "sarashina3-mini" if (in_sarashina_key.strip() and not in_gemini_key.strip()) else selected_model
                     new_guest_cfg = current_cfg_dict.copy()
                     new_guest_cfg.update({
                         "athlete_id": resolved_id,
                         "athlete_name": resolved_name,
                         "intervals_key": in_intervals_key.strip(),
                         "gemini_key": in_gemini_key.strip(),
+                        "sarashina_key": in_sarashina_key.strip(),
+                        "model": default_guest_model,
                         "ftp": resolved_ftp,
                         "weight": resolved_weight,
                         "target_ftp": int(in_target_ftp),
@@ -2347,8 +2512,10 @@ with tab_daily:
     )
 
     if st.button("⚡ 今日の最適ワークアウトを生成", type="primary", use_container_width=True):
-        if not gemini_key:
-            st.error("サイドバーで Gemini API Key を設定・保存してください。")
+        if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
+            st.error("サイドバーで Sarashina AI API Key を設定・保存してください。")
+        elif not gemini_key and not sarashina_key:
+            st.error("サイドバーで Gemini API Key または Sarashina AI API Key を設定・保存してください。")
         else:
             sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
             user_req = f"""
@@ -2366,11 +2533,14 @@ with tab_daily:
 3. **Intervals.icu カレンダー登録用のワークアウトコードブロック**（必ず ```workout から始めて記述すること。完全休養を推奨する場合はコードブロックは省略可）
 """
             try:
-                client_ai = genai.Client(api_key=gemini_key)
+                client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
                 st.session_state.generated_workout = ""
                 with st.spinner(f"AIコーチ（{selected_model}）が生理学データ・記憶を踏まえてメニューを設計中..."):
                     response_text = st.write_stream(
-                        stream_gemini_response(client_ai, selected_model, user_req, sys_prompt)
+                        stream_gemini_response(
+                            client_ai, selected_model, user_req, sys_prompt,
+                            sarashina_key=sarashina_key, gemini_key=gemini_key
+                        )
                     )
                     st.session_state.generated_workout = response_text
 
@@ -2468,8 +2638,10 @@ with tab_weekly:
         weekly_note = st.text_input("今週の予定・体調・要望メモ", value="水曜と金曜は休養日にしたい、日曜は実走メイン")
 
     if st.button("🗓️ 7日分の週間メニューを一括生成", type="primary", use_container_width=True):
-        if not gemini_key:
-            st.error("サイドバーで Gemini API Key を設定・保存してください。")
+        if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
+            st.error("サイドバーで Sarashina AI API Key を設定・保存してください。")
+        elif not gemini_key and not sarashina_key:
+            st.error("サイドバーで Gemini API Key または Sarashina AI API Key を設定・保存してください。")
         else:
             sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
             date_list_str = ", ".join([
@@ -2485,7 +2657,7 @@ with tab_weekly:
 """
             try:
                 with st.spinner(f"AIコーチ（{selected_model}）が7日間のメニューを構造化生成中..."):
-                    client_ai = genai.Client(api_key=gemini_key)
+                    client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
                     response = generate_content_with_retry(
                         client_ai=client_ai,
                         model_name=selected_model,
@@ -2494,7 +2666,10 @@ with tab_weekly:
                             system_instruction=sys_prompt,
                             response_mime_type="application/json",
                             response_schema=WeeklyPlanResponse,
-                        )
+                        ),
+                        sarashina_key=sarashina_key,
+                        gemini_key=gemini_key,
+                        sys_prompt=sys_prompt,
                     )
                     plan_obj = json.loads(response.text)
                     st.session_state.weekly_plan = plan_obj
@@ -2626,8 +2801,10 @@ with tab_debrief:
 
         btn_label = "🔄 このライドを再評価して記憶を更新する" if saved_review_obj else "🔍 このライドをAIコーチに詳しくレビューしてもらう"
         if st.button(btn_label, type="primary", use_container_width=True):
-            if not gemini_key:
-                st.error("サイドバーで Gemini API Key を設定・保存してください。")
+            if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
+                st.error("サイドバーで Sarashina AI API Key を設定・保存してください。")
+            elif not gemini_key and not sarashina_key:
+                st.error("サイドバーで Gemini API Key または Sarashina AI API Key を設定・保存してください。")
             else:
                 sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
 
@@ -2660,12 +2837,15 @@ with tab_debrief:
 5. **リカバリー＆次回への戦術アドバイス**: 具体的な栄養補給（糖質{nutri_info['immediate_carbs_g']}g＋タンパク質{nutri_info['protein_g']}g）、睡眠・HRV回復に向けたケア、明日以降のメニュー調整
 """
                 try:
-                    client_ai = genai.Client(api_key=gemini_key)
+                    client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
                     st.divider()
                     st.subheader("📋 AIコーチからのフィードバック")
                     with st.spinner(f"AIコーチ（{selected_model}）がライドデータを科学診断中..."):
                         review_text = st.write_stream(
-                            stream_gemini_response(client_ai, selected_model, debrief_req, sys_prompt)
+                            stream_gemini_response(
+                                client_ai, selected_model, debrief_req, sys_prompt,
+                                sarashina_key=sarashina_key, gemini_key=gemini_key
+                            )
                         )
                         st.session_state.ride_reviews[act_id] = {
                             "date": selected_ride["日付"],
@@ -2806,8 +2986,10 @@ with tab_chat:
             st.markdown(msg["content"])
 
     if prompt := st.chat_input("例: 今日のHRVと睡眠スコア的に走っても大丈夫？ / 富士ヒルで65分を切るためにあと何を伸ばすべき？"):
-        if not gemini_key:
-            st.error("サイドバーで Gemini API Key を設定・保存してください。")
+        if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
+            st.error("サイドバーで Sarashina AI API Key を設定・保存してください。")
+        elif not gemini_key and not sarashina_key:
+            st.error("サイドバーで Gemini API Key または Sarashina AI API Key を設定・保存してください。")
         else:
             st.session_state.messages.append({
                 "role": "user",
@@ -2821,7 +3003,7 @@ with tab_chat:
             with st.chat_message("assistant"):
                 try:
                     sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
-                    client_ai = genai.Client(api_key=gemini_key)
+                    client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
                     history_contents = [
                         types.Content(
                             role="user" if m["role"] == "user" else "model",
@@ -2830,7 +3012,10 @@ with tab_chat:
                         for m in st.session_state.messages[-20:]
                     ]
                     reply = st.write_stream(
-                        stream_gemini_response(client_ai, selected_model, history_contents, sys_prompt)
+                        stream_gemini_response(
+                            client_ai, selected_model, history_contents, sys_prompt,
+                            sarashina_key=sarashina_key, gemini_key=gemini_key
+                        )
                     )
                     st.session_state.messages.append({
                         "role": "assistant",
