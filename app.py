@@ -630,6 +630,30 @@ def generate_zwo_xml(workout_name: str, steps: list, ftp: int, description: str 
     return reparsed.toprettyxml(indent="  ")
 
 
+def _apply_high_contrast_chart_theme(chart, height: int):
+    """ダークモード時でもチャート背景を純白、軸ラベル・タイトルを濃紺(#0f172a)に固定して視認性を保証する"""
+    return (
+        chart.properties(height=height)
+        .configure(background="#ffffff", padding={"left": 12, "right": 12, "top": 10, "bottom": 10})
+        .configure_axis(
+            labelColor="#0f172a",
+            titleColor="#0f172a",
+            labelFontSize=11,
+            titleFontSize=12,
+            labelFontWeight="bold",
+            titleFontWeight="bold",
+            gridColor="#e2e8f0",
+            domainColor="#64748b",
+            tickColor="#64748b",
+        )
+        .configure_legend(
+            labelColor="#0f172a",
+            titleColor="#0f172a",
+        )
+        .configure_view(stroke="#cbd5e1", fill="#ffffff")
+    )
+
+
 def build_workout_chart(df: pd.DataFrame, ftp: int):
     if df.empty:
         return None
@@ -660,7 +684,7 @@ def build_workout_chart(df: pd.DataFrame, ftp: int):
         tooltip=[alt.Tooltip("label:N", title="基準ライン")]
     )
 
-    return (chart + ftp_line).properties(height=235)
+    return _apply_high_contrast_chart_theme(chart + ftp_line, 235)
 
 
 def build_tiz_bar_chart(zone_mins: dict):
@@ -678,12 +702,13 @@ def build_tiz_bar_chart(zone_mins: dict):
     order_list = list(color_map.keys())
     rows = [{"zone": k, "minutes": v, "color": color_map.get(k, "#0284c7")} for k, v in zone_mins.items()]
     df_z = pd.DataFrame(rows)
-    return alt.Chart(df_z).mark_bar(cornerRadiusEnd=4).encode(
+    ch = alt.Chart(df_z).mark_bar(cornerRadiusEnd=4).encode(
         x=alt.X("minutes:Q", title="滞在時間 (分)"),
         y=alt.Y("zone:N", sort=order_list, title="パワーゾーン"),
         color=alt.Color("color:N", scale=None),
         tooltip=[alt.Tooltip("zone:N", title="ゾーン"), alt.Tooltip("minutes:Q", title="時間 (分)")]
-    ).properties(height=165)
+    )
+    return _apply_high_contrast_chart_theme(ch, 165)
 
 
 def build_pdc_chart(pdc_info: dict, weight: float, current_ftp: int, target_ftp: int):
@@ -732,7 +757,7 @@ def build_pdc_chart(pdc_info: dict, weight: float, current_ftp: int, target_ftp:
         tooltip=[alt.Tooltip("level:N", title="基準")]
     )
 
-    return (area + line + rule).properties(height=240)
+    return _apply_high_contrast_chart_theme(area + line + rule, 240)
 
 
 def build_rider_profile_chart(pdc_info: dict):
@@ -748,12 +773,13 @@ def build_rider_profile_chart(pdc_info: dict):
         {"axis": "60分 長時間持久力 (Stamina)", "score": scores.get("60m", 0), "color": "#16a34a"},
     ]
     df_r = pd.DataFrame(rows)
-    return alt.Chart(df_r).mark_bar(cornerRadiusEnd=5).encode(
+    ch = alt.Chart(df_r).mark_bar(cornerRadiusEnd=5).encode(
         x=alt.X("score:Q", title="競技レベルスコア (100 = 国内トップアマ/富士ヒルプラチナ級)", scale=alt.Scale(domain=[0, 100])),
         y=alt.Y("axis:N", sort=[r["axis"] for r in rows], title="能力領域"),
         color=alt.Color("color:N", scale=None),
         tooltip=[alt.Tooltip("axis:N", title="領域"), alt.Tooltip("score:Q", title="スコア (/100)")]
-    ).properties(height=200)
+    )
+    return _apply_high_contrast_chart_theme(ch, 200)
 
 
 def build_wellness_chart(wellness_history: list):
@@ -789,7 +815,7 @@ def build_wellness_chart(wellness_history: list):
         ]
     )
 
-    return (hrv_line + sleep_line).properties(height=205)
+    return _apply_high_contrast_chart_theme(hrv_line + sleep_line, 205)
 
 
 def build_pmc_chart(pmc_history: list):
@@ -820,7 +846,7 @@ def build_pmc_chart(pmc_history: list):
     ctl_line = base.mark_line(color="#0284c7", strokeWidth=2.8).encode(y="ctl:Q")
     atl_line = base.mark_line(color="#e11d48", strokeWidth=2.2, strokeDash=[3, 2]).encode(y="atl:Q")
 
-    return (tsb_bars + ctl_line + atl_line).properties(height=205)
+    return _apply_high_contrast_chart_theme(tsb_bars + ctl_line + atl_line, 205)
 
 
 def build_ef_trend_chart(activities: list):
@@ -863,7 +889,7 @@ def build_ef_trend_chart(activities: list):
             alt.Tooltip("hr:Q", title="平均心拍 (bpm)"),
         ]
     )
-    return alt.layer(bars, line).resolve_scale(y="independent").properties(height=220)
+    return _apply_high_contrast_chart_theme(alt.layer(bars, line).resolve_scale(y="independent"), 220)
 
 
 # ==========================================
@@ -1727,39 +1753,68 @@ st.markdown("""
 <style>
     .block-container { padding-top: 3.8rem !important; padding-bottom: 6.5rem !important; max-width: 1320px; }
 
-    /* KPI メトリクスカード：ライト・ダーク両モードで純白背景＋ディープネイビー文字を完全保証 */
-    div[data-testid="stMetric"] {
+    /* KPI メトリクスカード：純白背景＋濃紺文字を <label data-testid="stMetricLabel"> 含め全階層で完全保証 */
+    [data-testid="stMetric"] {
         background: #ffffff !important;
         border: 1px solid #94a3b8 !important;
         border-left: 5px solid #0284c7 !important;
         padding: 0.85rem 1.05rem !important;
         border-radius: 0.75rem !important;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12) !important;
+        color: #0f172a !important;
     }
-    div[data-testid="stMetricLabel"],
-    div[data-testid="stMetricLabel"] *,
-    div[data-testid="stMetricLabel"] p,
-    div[data-testid="stMetricLabel"] span {
-        color: #1e293b !important;
-        font-size: 0.84rem !important;
+    [data-testid="stMetric"] label,
+    [data-testid="stMetric"] label *,
+    [data-testid="stMetricLabel"],
+    label[data-testid="stMetricLabel"],
+    [data-testid="stMetricLabel"] *,
+    [data-testid="stMetricLabel"] [data-testid="stMarkdownContainer"],
+    [data-testid="stMetricLabel"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stMetricLabel"] p,
+    [data-testid="stMetricLabel"] span,
+    [data-testid="stMetricLabel"] div {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        font-size: 0.85rem !important;
         font-weight: 700 !important;
         opacity: 1 !important;
     }
-    div[data-testid="stMetricValue"],
-    div[data-testid="stMetricValue"] *,
-    div[data-testid="stMetricValue"] > div {
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricValue"] *,
+    [data-testid="stMetricValue"] [data-testid="stMarkdownContainer"],
+    [data-testid="stMetricValue"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stMetricValue"] p,
+    [data-testid="stMetricValue"] span,
+    [data-testid="stMetricValue"] div {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-size: 1.5rem !important;
         font-weight: 800 !important;
         letter-spacing: -0.02em !important;
+        opacity: 1 !important;
     }
-    div[data-testid="stMetricDelta"],
-    div[data-testid="stMetricDelta"] * {
-        color: #0369a1 !important;
-        background-color: #e0f2fe !important;
+    [data-testid="stMetricDelta"] {
+        background-color: #dcfce7 !important;
+        color: #14532d !important;
+        -webkit-text-fill-color: #14532d !important;
         font-weight: 700 !important;
         font-size: 0.78rem !important;
-        border-radius: 6px !important;
+        border-radius: 999px !important;
+        padding: 0.15rem 0.55rem !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stMetricDelta"] *,
+    [data-testid="stMetricDelta"] [data-testid="stMarkdownContainer"],
+    [data-testid="stMetricDelta"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stMetricDelta"] p,
+    [data-testid="stMetricDelta"] span,
+    [data-testid="stMetricDelta"] div,
+    [data-testid="stMetricDelta"] svg {
+        color: #14532d !important;
+        -webkit-text-fill-color: #14532d !important;
+        fill: #15803d !important;
+        font-weight: 700 !important;
+        opacity: 1 !important;
     }
 
     /* トップ・テレメトリーバナー：爽やかなスカイブルーグラデーション＋濃紺テキスト */
@@ -1778,9 +1833,11 @@ st.markdown("""
     .telemetry-banner p,
     .telemetry-banner div {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
     }
     .telemetry-sub {
         color: #1e293b !important;
+        -webkit-text-fill-color: #1e293b !important;
         font-weight: 600 !important;
     }
 
@@ -1795,89 +1852,165 @@ st.markdown("""
         margin-top: 0.2rem;
         background: #ffffff !important;
         color: #0369a1 !important;
+        -webkit-text-fill-color: #0369a1 !important;
         border: 1px solid #0284c7 !important;
         box-shadow: 0 1px 2px rgba(2, 132, 199, 0.1);
     }
 
-    /* エクスパンダー：ヘッダーは明るいスカイブルー＋濃紺文字、中身はテーマ背景（ダーク時は黒背景＋白文字、ライト時は白背景＋黒文字）に自動追従 */
-    div[data-testid="stExpander"] {
-        border: 1px solid rgba(56, 189, 248, 0.45) !important;
+    /* 情報・警告アラートボックス (st.info / st.warning / st.success)：ライトブルー背景＋濃紺文字を完全保証 */
+    [data-testid="stAlert"] {
+        background-color: #e0f2fe !important;
+        border: 1px solid #38bdf8 !important;
+        border-left: 5px solid #0284c7 !important;
+        border-radius: 0.65rem !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stAlert"] *,
+    [data-testid="stAlert"] [data-testid="stMarkdownContainer"],
+    [data-testid="stAlert"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stAlert"] p,
+    [data-testid="stAlert"] li,
+    [data-testid="stAlert"] span,
+    [data-testid="stAlert"] strong,
+    [data-testid="stAlert"] div {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        opacity: 1 !important;
+    }
+
+    /* エクスパンダー：白カード背景に対し、ダークモード時でも内部のタイトル・説明文・箇条書き・キャプションを全て濃紺(#0f172a)に固定 */
+    [data-testid="stExpander"] {
+        border: 1px solid #94a3b8 !important;
         border-radius: 0.75rem !important;
-        background: var(--background-color) !important;
+        background: #ffffff !important;
         box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08) !important;
         margin-bottom: 0.85rem !important;
         overflow: hidden !important;
+        color: #0f172a !important;
     }
-    div[data-testid="stExpander"] details summary {
+    [data-testid="stExpander"] details summary {
         background: linear-gradient(90deg, #e0f2fe 0%, #f1f5f9 100%) !important;
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-weight: 700 !important;
         padding: 0.7rem 1rem !important;
-        border-bottom: 1px solid rgba(56, 189, 248, 0.3) !important;
+        border-bottom: 1px solid #bae6fd !important;
     }
-    div[data-testid="stExpander"] details summary *,
-    div[data-testid="stExpander"] details summary p,
-    div[data-testid="stExpander"] details summary span,
-    div[data-testid="stExpander"] details summary svg {
+    [data-testid="stExpander"] details summary *,
+    [data-testid="stExpander"] details summary [data-testid="stMarkdownContainer"],
+    [data-testid="stExpander"] details summary [data-testid="stMarkdownContainer"] *,
+    [data-testid="stExpander"] details summary p,
+    [data-testid="stExpander"] details summary span,
+    [data-testid="stExpander"] details summary svg {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         fill: #0f172a !important;
         font-weight: 700 !important;
         font-size: 0.95rem !important;
+        opacity: 1 !important;
     }
-    div[data-testid="stExpanderDetails"] {
-        background: var(--background-color) !important;
-        color: var(--text-color) !important;
+    [data-testid="stExpanderDetails"] {
+        background: #ffffff !important;
+        color: #0f172a !important;
         padding-top: 0.8rem !important;
     }
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"],
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] li,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] span,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] strong,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] em,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h3,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h4,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h5,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h6,
+    [data-testid="stExpanderDetails"] [data-testid="stCaptionContainer"],
+    [data-testid="stExpanderDetails"] [data-testid="stCaptionContainer"] *,
+    [data-testid="stExpanderDetails"] label,
+    [data-testid="stExpanderDetails"] label * {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] a {
+        color: #0284c7 !important;
+        -webkit-text-fill-color: #0284c7 !important;
+        font-weight: 700 !important;
+        text-decoration: underline !important;
+    }
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] code {
+        background-color: #e2e8f0 !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        padding: 0.15rem 0.35rem !important;
+        border-radius: 4px !important;
+    }
+    [data-testid="stExpanderDetails"] input,
+    [data-testid="stExpanderDetails"] textarea {
+        background-color: #f8fafc !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        border: 1px solid #94a3b8 !important;
+    }
 
-    /* キャプションやラベルがダークモードで暗く沈まないよう明度を確保 */
-    div[data-testid="stCaptionContainer"],
-    div[data-testid="stCaptionContainer"] p {
-        color: var(--text-color) !important;
-        opacity: 0.9 !important;
+    /* 通常のキャプションもダークモードで薄くなりすぎないよう不透明度を確保 */
+    [data-testid="stCaptionContainer"],
+    [data-testid="stCaptionContainer"] p {
+        opacity: 0.95 !important;
         font-size: 0.88rem !important;
     }
 
-    /* タブバー：非選択タブも明瞭なピル背景＋濃紺文字、選択タブは鮮やかなブルー背景＋白文字でダークモードでも視認性抜群 */
-    button[data-baseweb="tab"] {
+    /* タブバー（React Aria [data-testid="stTab"] & BaseWeb 両対応）：非選択タブも明瞭なピル背景＋濃紺文字、選択タブはブルー背景＋白文字 */
+    button[data-baseweb="tab"],
+    [data-testid="stTab"] {
         background-color: #e2e8f0 !important;
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-weight: 700 !important;
         padding: 0.55rem 1.05rem !important;
         border-radius: 0.55rem 0.55rem 0 0 !important;
         margin-right: 0.3rem !important;
         border: 1px solid #cbd5e1 !important;
     }
-    button[data-baseweb="tab"] p,
-    button[data-baseweb="tab"] span,
-    button[data-baseweb="tab"] div {
+    button[data-baseweb="tab"] *,
+    [data-testid="stTab"] *,
+    [data-testid="stTab"] [data-testid="stMarkdownContainer"] * {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-weight: 700 !important;
     }
-    button[data-baseweb="tab"][aria-selected="true"] {
+    button[data-baseweb="tab"][aria-selected="true"],
+    [data-testid="stTab"][aria-selected="true"],
+    [data-testid="stTab"][data-selected] {
         background-color: #0284c7 !important;
         color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
         border: 1px solid #0284c7 !important;
     }
-    button[data-baseweb="tab"][aria-selected="true"] p,
-    button[data-baseweb="tab"][aria-selected="true"] span,
-    button[data-baseweb="tab"][aria-selected="true"] div {
+    button[data-baseweb="tab"][aria-selected="true"] *,
+    [data-testid="stTab"][aria-selected="true"] *,
+    [data-testid="stTab"][data-selected] *,
+    [data-testid="stTab"][aria-selected="true"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stTab"][data-selected] [data-testid="stMarkdownContainer"] * {
         color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
         font-weight: 800 !important;
     }
 
     /* AIコーチ相談のチャット入力欄を常に画面最下部に固定表示 */
-    div[data-testid="stChatInput"] {
+    [data-testid="stChatInput"] {
         position: fixed !important;
         bottom: 0 !important;
         left: 50% !important;
         transform: translateX(-50%) !important;
         width: min(1280px, 94vw) !important;
         z-index: 999 !important;
-        background: var(--background-color) !important;
+        background: #1e293b !important;
         padding: 0.65rem 1rem 0.9rem 1rem !important;
         border-top: 2px solid #0284c7 !important;
-        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25) !important;
+        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.3) !important;
         border-radius: 0.85rem 0.85rem 0 0 !important;
     }
 </style>
@@ -2481,13 +2614,13 @@ if st.session_state.metrics and st.session_state.metrics.get("wellness_readiness
             w_chart = build_wellness_chart(w_hist)
             if w_chart:
                 st.caption("📈 直近14日間の HRV (紫・実線) ＆ 睡眠スコア (水色・破線) 推移")
-                st.altair_chart(w_chart, use_container_width=True)
+                st.altair_chart(w_chart, use_container_width=True, theme=None)
         with ch_col2:
             pmc_hist = st.session_state.metrics.get("pmc_history", [])
             pmc_chart = build_pmc_chart(pmc_hist)
             if pmc_chart:
                 st.caption("📊 直近40日間の PMC推移 — 水色線:CTL / 赤破線:ATL / 棒:TSB(フォーム)")
-                st.altair_chart(pmc_chart, use_container_width=True)
+                st.altair_chart(pmc_chart, use_container_width=True, theme=None)
 
 # --- エクスパンダー2: 過去1年のパワーカーブ (PDC) & CP/W'・5軸脚質・7ゾーン一覧 ---
 if st.session_state.metrics and "pdc" in st.session_state.metrics:
@@ -2507,12 +2640,12 @@ if st.session_state.metrics and "pdc" in st.session_state.metrics:
         with p_col1:
             st.caption("📈 1年ベスト・パワーデュレーションカーブ (W/kg)")
             pdc_chart = build_pdc_chart(pdc, weight, ftp, target_ftp)
-            st.altair_chart(pdc_chart, use_container_width=True)
+            st.altair_chart(pdc_chart, use_container_width=True, theme=None)
         with p_col2:
             st.caption("🎯 5軸ライダー能力バランス (100 = 国内トップアマ/富士ヒルプラチナ基準)")
             prof_chart = build_rider_profile_chart(pdc)
             if prof_chart:
-                st.altair_chart(prof_chart, use_container_width=True)
+                st.altair_chart(prof_chart, use_container_width=True, theme=None)
 
         st.markdown("##### ⚡ あなたの現在のパワートレーニングゾーン表 (FTP: " + f"`{ftp}W` / `{current_pwr}W/kg` 基準)")
         zones_df = pd.DataFrame([
@@ -2643,12 +2776,12 @@ with tab_daily:
             with ch_w1:
                 chart = build_workout_chart(df_chart, ftp)
                 if chart:
-                    st.altair_chart(chart, use_container_width=True)
+                    st.altair_chart(chart, use_container_width=True, theme=None)
             with ch_w2:
                 if w_stats and w_stats.get("zone_mins"):
                     tiz_chart = build_tiz_bar_chart(w_stats["zone_mins"])
                     if tiz_chart:
-                        st.altair_chart(tiz_chart, use_container_width=True)
+                        st.altair_chart(tiz_chart, use_container_width=True, theme=None)
 
             col_p1, col_p2, col_p3 = st.columns([2, 1, 1])
             with col_p1:
@@ -2763,7 +2896,7 @@ with tab_weekly:
                     steps_w, df_w = parse_intervals_workout(day_item["workout_code"], ftp)
                     ch_w = build_workout_chart(df_w, ftp)
                     if ch_w:
-                        st.altair_chart(ch_w, use_container_width=True)
+                        st.altair_chart(ch_w, use_container_width=True, theme=None)
                     zwo_day = generate_zwo_xml(day_item["title"], steps_w, ftp)
                     st.download_button(
                         f"📥 {day_item['date']} 用 (.zwo) DL",
@@ -3181,7 +3314,7 @@ with tab_history:
         if ef_chart:
             st.subheader("📈 直近40日間の有酸素効率 (EF = NP / 平均心拍) ＆ TSS 推移")
             st.caption("緑の実線（EF）が右肩上がりであれば、同じ心拍数でより高いパワーを出せる（有酸素エンジンが強化されている）証拠です。")
-            st.altair_chart(ef_chart, use_container_width=True)
+            st.altair_chart(ef_chart, use_container_width=True, theme=None)
             st.divider()
 
         st.subheader("📋 直近40日間のライド履歴一覧（EF・VI・仕事量付き）")
