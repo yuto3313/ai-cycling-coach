@@ -1270,10 +1270,11 @@ def solve_hillclimb_physics(
     crr: float = 0.0045,
     cda: float = 0.32,
     drivetrain_loss: float = 0.025,
+    draft_saving_pct: float = 0.0,
 ) -> dict:
     """
-    ニュートン力学（重力抵抗＋転がり抵抗＋標高別空気密度による空気抵抗＋駆動ロス）から
-    登坂速度・予想タイム・標高による有酸素パワー減衰補正を計算する。
+    ニュートン力学（重力抵抗＋転がり抵抗＋標高別空気密度＆ドラフティング軽減率による空気抵抗＋駆動ロス）から
+    登坂速度・予想タイム・標高による有酸素パワー減衰補正・必要ワット数を計算する。
     """
     dist_m = max(100.0, distance_km * 1000.0)
     grade = elevation_m / dist_m
@@ -1283,15 +1284,19 @@ def solve_hillclimb_physics(
 
     # 標高に応じた空気密度 rho (kg/m^3)
     rho = 1.225 * math.exp(-alt_m / 8500.0)
+    # ドラフティングによる実効CdA (空気抵抗軽減率 0〜50%)
+    draft_clamped = max(0.0, min(55.0, float(draft_saving_pct)))
+    eff_cda = cda * (1.0 - draft_clamped / 100.0)
     eff_power = watts * (1.0 - drivetrain_loss)
+
+    f_grav = total_mass * g * math.sin(theta)
+    f_roll = total_mass * g * math.cos(theta) * crr
 
     # 二分探索で平衡速度 v (m/s) を解く
     low_v, high_v = 0.5, 25.0
     for _ in range(50):
         mid_v = (low_v + high_v) / 2.0
-        f_grav = total_mass * g * math.sin(theta)
-        f_roll = total_mass * g * math.cos(theta) * crr
-        f_aero = 0.5 * rho * cda * (mid_v ** 2)
+        f_aero = 0.5 * rho * eff_cda * (mid_v ** 2)
         req_p = (f_grav + f_roll + f_aero) * mid_v
         if req_p > eff_power:
             high_v = mid_v
@@ -1301,17 +1306,23 @@ def solve_hillclimb_physics(
     v_ms = (low_v + high_v) / 2.0
     time_sec = dist_m / v_ms
     vam = (elevation_m / (time_sec / 3600.0)) if time_sec > 0 else 0
+    aero_watts = ((0.5 * rho * eff_cda * (v_ms ** 3)) / (1.0 - drivetrain_loss)) if (1.0 - drivetrain_loss) > 0 else 0.0
 
-    # 高地（標高）による有酸素能力の低下率 (Bassett et al. モデル: 1000m超で1000mあたり約6.5%低下)
+    # 高地（標高）による有酸素能力の低下率 (Bassett et al. モデル: 1000m超で1000mあたり約6.3%低下)
     altitude_penalty_pct = round(max(0.0, (alt_m - 800.0) / 1000.0 * 6.3), 1) if alt_m > 800 else 0.0
 
     return {
         "time_sec": time_sec,
         "time_min": round(time_sec / 60.0, 2),
         "speed_kmh": round(v_ms * 3.6, 1),
+        "v_ms": v_ms,
         "vam": int(round(vam)),
         "grade_pct": round(grade * 100, 1),
         "altitude_penalty_pct": altitude_penalty_pct,
+        "eff_cda": round(eff_cda, 3),
+        "aero_watts": round(aero_watts, 1),
+        "rho": rho,
+        "f_grav_roll": f_grav + f_roll,
     }
 
 
@@ -1714,26 +1725,28 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 3.8rem !important; padding-bottom: 2.5rem !important; max-width: 1320px; }
+    .block-container { padding-top: 3.8rem !important; padding-bottom: 6.5rem !important; max-width: 1320px; }
 
-    /* KPI メトリクスカード：純白背景＋ディープネイビー文字＋スカイブルー左アクセントで視認性を極限まで向上 */
+    /* KPI メトリクスカード：ライト・ダーク両モードで純白背景＋ディープネイビー文字を完全保証 */
     div[data-testid="stMetric"] {
         background: #ffffff !important;
-        border: 1px solid #cbd5e1 !important;
+        border: 1px solid #94a3b8 !important;
         border-left: 5px solid #0284c7 !important;
         padding: 0.85rem 1.05rem !important;
         border-radius: 0.75rem !important;
-        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06) !important;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12) !important;
     }
     div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] *,
     div[data-testid="stMetricLabel"] p,
     div[data-testid="stMetricLabel"] span {
-        color: #334155 !important;
+        color: #1e293b !important;
         font-size: 0.84rem !important;
         font-weight: 700 !important;
         opacity: 1 !important;
     }
     div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] *,
     div[data-testid="stMetricValue"] > div {
         color: #0f172a !important;
         font-size: 1.5rem !important;
@@ -1741,21 +1754,24 @@ st.markdown("""
         letter-spacing: -0.02em !important;
     }
     div[data-testid="stMetricDelta"],
-    div[data-testid="stMetricDelta"] > div {
-        font-weight: 600 !important;
+    div[data-testid="stMetricDelta"] * {
+        color: #0369a1 !important;
+        background-color: #e0f2fe !important;
+        font-weight: 700 !important;
         font-size: 0.78rem !important;
+        border-radius: 6px !important;
     }
 
     /* トップ・テレメトリーバナー：爽やかなスカイブルーグラデーション＋濃紺テキスト */
     .telemetry-banner {
         background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%) !important;
-        border: 1px solid #7dd3fc !important;
+        border: 1px solid #38bdf8 !important;
         border-left: 6px solid #0284c7 !important;
         border-radius: 0.85rem !important;
         padding: 1.0rem 1.35rem !important;
         margin-bottom: 1.0rem !important;
         color: #0f172a !important;
-        box-shadow: 0 3px 10px rgba(2, 132, 199, 0.08) !important;
+        box-shadow: 0 3px 10px rgba(2, 132, 199, 0.12) !important;
     }
     .telemetry-banner h2,
     .telemetry-banner span,
@@ -1764,7 +1780,7 @@ st.markdown("""
         color: #0f172a !important;
     }
     .telemetry-sub {
-        color: #334155 !important;
+        color: #1e293b !important;
         font-weight: 600 !important;
     }
 
@@ -1779,41 +1795,90 @@ st.markdown("""
         margin-top: 0.2rem;
         background: #ffffff !important;
         color: #0369a1 !important;
-        border: 1px solid #38bdf8 !important;
-        box-shadow: 0 1px 2px rgba(2, 132, 199, 0.08);
+        border: 1px solid #0284c7 !important;
+        box-shadow: 0 1px 2px rgba(2, 132, 199, 0.1);
     }
 
-    /* エクスパンダー（折りたたみパネル）の視認性強化 */
+    /* エクスパンダー：ヘッダーは明るいスカイブルー＋濃紺文字、中身はテーマ背景（ダーク時は黒背景＋白文字、ライト時は白背景＋黒文字）に自動追従 */
     div[data-testid="stExpander"] {
-        border: 1px solid #cbd5e1 !important;
+        border: 1px solid rgba(56, 189, 248, 0.45) !important;
         border-radius: 0.75rem !important;
-        background: #ffffff !important;
-        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04) !important;
-        margin-bottom: 0.75rem !important;
+        background: var(--background-color) !important;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08) !important;
+        margin-bottom: 0.85rem !important;
+        overflow: hidden !important;
     }
     div[data-testid="stExpander"] details summary {
-        background: #f8fafc !important;
+        background: linear-gradient(90deg, #e0f2fe 0%, #f1f5f9 100%) !important;
         color: #0f172a !important;
         font-weight: 700 !important;
-        border-radius: 0.75rem !important;
-        padding: 0.65rem 1rem !important;
+        padding: 0.7rem 1rem !important;
+        border-bottom: 1px solid rgba(56, 189, 248, 0.3) !important;
     }
-    div[data-testid="stExpander"] details summary p {
+    div[data-testid="stExpander"] details summary *,
+    div[data-testid="stExpander"] details summary p,
+    div[data-testid="stExpander"] details summary span,
+    div[data-testid="stExpander"] details summary svg {
         color: #0f172a !important;
+        fill: #0f172a !important;
         font-weight: 700 !important;
         font-size: 0.95rem !important;
     }
+    div[data-testid="stExpanderDetails"] {
+        background: var(--background-color) !important;
+        color: var(--text-color) !important;
+        padding-top: 0.8rem !important;
+    }
 
-    /* タブバーの視認性・操作感向上 */
+    /* キャプションやラベルがダークモードで暗く沈まないよう明度を確保 */
+    div[data-testid="stCaptionContainer"],
+    div[data-testid="stCaptionContainer"] p {
+        color: var(--text-color) !important;
+        opacity: 0.9 !important;
+        font-size: 0.88rem !important;
+    }
+
+    /* タブバー：非選択タブも明瞭なピル背景＋濃紺文字、選択タブは鮮やかなブルー背景＋白文字でダークモードでも視認性抜群 */
     button[data-baseweb="tab"] {
+        background-color: #e2e8f0 !important;
+        color: #0f172a !important;
         font-weight: 700 !important;
-        color: #334155 !important;
-        padding: 0.55rem 1rem !important;
+        padding: 0.55rem 1.05rem !important;
+        border-radius: 0.55rem 0.55rem 0 0 !important;
+        margin-right: 0.3rem !important;
+        border: 1px solid #cbd5e1 !important;
+    }
+    button[data-baseweb="tab"] p,
+    button[data-baseweb="tab"] span,
+    button[data-baseweb="tab"] div {
+        color: #0f172a !important;
+        font-weight: 700 !important;
     }
     button[data-baseweb="tab"][aria-selected="true"] {
-        color: #0284c7 !important;
-        background-color: #f0f9ff !important;
-        border-radius: 0.5rem 0.5rem 0 0 !important;
+        background-color: #0284c7 !important;
+        color: #ffffff !important;
+        border: 1px solid #0284c7 !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] p,
+    button[data-baseweb="tab"][aria-selected="true"] span,
+    button[data-baseweb="tab"][aria-selected="true"] div {
+        color: #ffffff !important;
+        font-weight: 800 !important;
+    }
+
+    /* AIコーチ相談のチャット入力欄を常に画面最下部に固定表示 */
+    div[data-testid="stChatInput"] {
+        position: fixed !important;
+        bottom: 0 !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        width: min(1280px, 94vw) !important;
+        z-index: 999 !important;
+        background: var(--background-color) !important;
+        padding: 0.65rem 1rem 0.9rem 1rem !important;
+        border-top: 2px solid #0284c7 !important;
+        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25) !important;
+        border-radius: 0.85rem 0.85rem 0 0 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -2871,8 +2936,8 @@ with tab_debrief:
 # Tab 4: レース＆ヒルクライム物理シミュレーター・補給戦略
 # ==========================================
 with tab_simulator:
-    st.subheader("🏔️ ヒルクライム＆目標レース 物理タイムシミュレーター ＆ 補給・ペーシング戦略")
-    st.caption("ニュートン力学（重力・転がり抵抗・標高別空気密度・駆動ロス）と高地低酸素モデルを用い、富士ヒル等の予想タイムや「軽量化 vs パワー向上」の秒数短縮効果を精密計算します。")
+    st.subheader("🏔️ ヒルクライム＆目標レース 物理タイムシミュレーター ＆ ドラフティング・補給戦略")
+    st.caption("ニュートン力学（重力・転がり抵抗・標高別空気密度・ドラフティング空気抵抗軽減・駆動ロス）と高地低酸素モデルを用い、予想タイムや「ドラフティング効果」「軽量化 vs パワー向上」を精密計算します。")
 
     climb_presets = {
         "🗻 Mt.富士ヒルクライム (計測24.0km / 標高差1,255m / 平均勾配5.2% / 平均標高1,750m)": {"dist": 24.0, "elev": 1255, "alt": 1750},
@@ -2883,8 +2948,21 @@ with tab_simulator:
         "🛠️ カスタムコース（距離・獲得標高を自由入力）": {"dist": 15.0, "elev": 800, "alt": 800},
     }
 
-    selected_preset = st.selectbox("📍 コースプリセット選択", list(climb_presets.keys()))
-    preset_vals = climb_presets[selected_preset]
+    draft_presets = {
+        "👤 単独走行（ソロ・空気抵抗軽減 0%）": 0,
+        "🔄 2〜3人先頭交代ローテーション（平均 12%軽減）": 12,
+        "🚴‍♂️🚴‍♂️ 前走者の真後ろ・ツキイチ追走（22%軽減）": 22,
+        "🚄 中規模トレイン・5〜8人パック中盤（32%軽減）": 32,
+        "🐝 大集団ペロトン内部・選抜/ゴールドトレイン（40%軽減）": 40,
+    }
+
+    top_p1, top_p2 = st.columns([1.4, 1.2])
+    with top_p1:
+        selected_preset = st.selectbox("📍 コースプリセット選択", list(climb_presets.keys()))
+        preset_vals = climb_presets[selected_preset]
+    with top_p2:
+        selected_draft_label = st.selectbox("💨 ドラフティング・集団位置プリセット", list(draft_presets.keys()), index=0)
+        default_draft_pct = draft_presets[selected_draft_label]
 
     sim_c1, sim_c2, sim_c3, sim_c4 = st.columns(4)
     with sim_c1:
@@ -2898,19 +2976,43 @@ with tab_simulator:
         sim_intensity_pct = st.slider("レース巡航強度 (%FTP)", 75, 110, 95, 1)
     with sim_c4:
         sim_ftp_base = st.number_input("基準FTP (W)", 100, 500, int(ftp), 5)
+        sim_draft_pct = st.slider("💨 空気抵抗軽減率 (ドラフティング %)", 0, 45, int(default_draft_pct), 1)
         apply_alt_penalty = st.checkbox("高地（低酸素）による有酸素出力減衰を適用", value=(preset_vals["alt"] >= 1200))
 
     raw_target_watts = round(sim_ftp_base * (sim_intensity_pct / 100.0))
-    prelim = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, raw_target_watts, sim_alt)
+    prelim = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, raw_target_watts, sim_alt, draft_saving_pct=0.0)
     alt_drop_pct = prelim["altitude_penalty_pct"] if apply_alt_penalty else 0.0
     effective_watts = round(raw_target_watts * (1.0 - alt_drop_pct / 100.0))
 
-    sim_res = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, effective_watts, sim_alt)
+    # 単独走行(0%) と 現在のドラフティング設定(sim_draft_pct%) の両方を計算
+    solo_res = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, effective_watts, sim_alt, draft_saving_pct=0.0)
+    sim_res = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, effective_watts, sim_alt, draft_saving_pct=sim_draft_pct)
+
+    def _fmt_time(sec_float: float) -> str:
+        t_s = int(round(sec_float))
+        hh, rem = divmod(t_s, 3600)
+        mm, ss = divmod(rem, 60)
+        return f"{hh}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm}分{ss:02d}秒"
+
+    def _fmt_diff_sec(diff_s: int) -> str:
+        if diff_s == 0:
+            return "±0秒 (単独基準)"
+        sign = "-" if diff_s < 0 else "+"
+        abs_s = abs(diff_s)
+        mm, ss = divmod(abs_s, 60)
+        return f"{sign}{mm}分{ss:02d}秒 ({diff_s:+}秒)" if mm > 0 else f"{diff_s:+}秒"
+
     total_sec = int(round(sim_res["time_sec"]))
-    h_val, rem_s = divmod(total_sec, 3600)
-    m_val, s_val = divmod(rem_s, 60)
-    time_formatted = f"{h_val}:{m_val:02d}:{s_val:02d}" if h_val > 0 else f"{m_val}分{s_val:02d}秒"
-    total_min_Only = total_sec // 60
+    solo_sec = int(round(solo_res["time_sec"]))
+    draft_time_diff_sec = total_sec - solo_sec
+    time_formatted = _fmt_time(sim_res["time_sec"])
+
+    # 単独走行と同じタイム(速度 solo_res['v_ms'])で走るために必要なパワーと温存ワット数
+    solo_v = solo_res["v_ms"]
+    req_watts_at_solo_speed = round(
+        ((solo_res["f_grav_roll"] + 0.5 * solo_res["rho"] * sim_res["eff_cda"] * (solo_v ** 2)) * solo_v) / (1.0 - 0.025)
+    )
+    saved_watts_vs_solo = max(0, effective_watts - req_watts_at_solo_speed)
 
     # 富士ヒルリング判定
     ring_badge = ""
@@ -2928,18 +3030,53 @@ with tab_simulator:
 
     res_c1, res_c2, res_c3, res_c4, res_c5 = st.columns(5)
     res_c1.metric("🏁 予想ゴールタイム", time_formatted, ring_badge or f"平均勾配 {sim_res['grade_pct']}%")
-    res_c2.metric("⚡ 実効巡航パワー", f"{effective_watts} W", f"平地換算 {raw_target_watts}W (高地減衰 -{alt_drop_pct}%)" if alt_drop_pct > 0 else f"{sim_intensity_pct}% FTP")
-    res_c3.metric("⚖️ 実効 PWR", f"{round(effective_watts / sim_rider_kg, 2)} W/kg", f"総重量 {round(sim_rider_kg + sim_bike_kg, 1)} kg")
-    res_c4.metric("🚀 平均速度", f"{sim_res['speed_kmh']} km/h")
-    res_c5.metric("🧗 VAM (平均上昇速度)", f"{sim_res['vam']} m/h")
+    res_c2.metric(
+        "💨 ドラフティング恩恵",
+        f"{abs(draft_time_diff_sec)}秒 短縮" if draft_time_diff_sec < 0 else "単独走行 (0%)",
+        f"単独比 {_fmt_diff_sec(draft_time_diff_sec)} / {saved_watts_vs_solo}W温存相当" if sim_draft_pct > 0 else f"実効CdA: {sim_res['eff_cda']}"
+    )
+    res_c3.metric("⚡ 実効巡航パワー", f"{effective_watts} W", f"平地換算 {raw_target_watts}W (高地 -{alt_drop_pct}%)" if alt_drop_pct > 0 else f"{sim_intensity_pct}% FTP")
+    res_c4.metric("⚖️ 実効 PWR", f"{round(effective_watts / sim_rider_kg, 2)} W/kg", f"総重量 {round(sim_rider_kg + sim_bike_kg, 1)} kg")
+    res_c5.metric("🚀 平均速度 / VAM", f"{sim_res['speed_kmh']} km/h", f"VAM: {sim_res['vam']} m/h")
+
+    st.markdown("##### 💨 ドラフティング（集団・トレイン活用）によるタイム差 ＆ 温存パワー比較表")
+    st.caption(
+        f"同じ実効パワー（**{effective_watts}W**）で走った場合に**どれだけタイムが縮まるか**、および単独タイム（**{_fmt_time(solo_res['time_sec'])}**）と同じペースで登る場合に**何ワット脚を温存できるか**の比較です。"
+    )
+    draft_table_rows = []
+    for d_label, d_pct in [
+        ("👤 単独走行（ソロ・基準）", 0),
+        ("🔄 2〜3人ローテーション（先頭交代）", 12),
+        ("🚴‍♂️🚴‍♂️ 前走者の真後ろ（ツキイチ追走）", 22),
+        ("🚄 中規模トレイン中盤（5〜8人パック）", 32),
+        ("🐝 大集団ペロトン内部（選抜・大パック）", 40),
+    ]:
+        r_d = solve_hillclimb_physics(sim_dist, sim_elev, sim_rider_kg, sim_bike_kg, effective_watts, sim_alt, draft_saving_pct=d_pct)
+        diff_s = int(round(r_d["time_sec"])) - solo_sec
+        req_w_same_speed = round(
+            ((solo_res["f_grav_roll"] + 0.5 * solo_res["rho"] * r_d["eff_cda"] * (solo_v ** 2)) * solo_v) / (1.0 - 0.025)
+        )
+        save_w = max(0, effective_watts - req_w_same_speed)
+        draft_table_rows.append({
+            "走行形態・パック位置": d_label,
+            "空気抵抗軽減率": f"-{d_pct}% (実効CdA: {r_d['eff_cda']})",
+            f"{effective_watts}W での予想タイム": _fmt_time(r_d["time_sec"]),
+            "単独比タイム短縮": _fmt_diff_sec(diff_s),
+            "平均速度": f"{r_d['speed_kmh']} km/h",
+            "単独タイム維持の必要出力 (温存W)": f"{req_w_same_speed} W (-{save_w}W 温存)" if d_pct > 0 else f"{effective_watts} W (基準)",
+        })
+    st.dataframe(pd.DataFrame(draft_table_rows), hide_index=True, use_container_width=True)
 
     st.markdown("##### 📊 「軽量化（減量・機材軽量化）」vs「パワー向上」によるタイム短縮効果マトリクス")
-    st.caption("現在の条件（" + time_formatted + "）から、体重/機材重量を減らした場合と平均パワーを上げた場合に何秒短縮できるかの比較表です。")
+    st.caption(f"現在の設定（ドラフティング -{sim_draft_pct}% / 予想タイム {time_formatted}）を基準に、重量を減らした場合とパワーを上げた場合の比較表です。")
     matrix_rows = []
     for w_delta in [0.0, -0.5, -1.0, -1.5, -2.0]:
         row_dict = {"重量変化 (体重+機材)": f"{w_delta:+.1f} kg ({round(sim_rider_kg + w_delta, 1)}kg)" if w_delta != 0 else f"±0.0 kg (現在: {sim_rider_kg}kg)"}
         for p_delta in [0, 5, 10, 15, 20]:
-            r_m = solve_hillclimb_physics(sim_dist, sim_elev, max(35.0, sim_rider_kg + w_delta), sim_bike_kg, effective_watts + p_delta, sim_alt)
+            r_m = solve_hillclimb_physics(
+                sim_dist, sim_elev, max(35.0, sim_rider_kg + w_delta), sim_bike_kg,
+                effective_watts + p_delta, sim_alt, draft_saving_pct=sim_draft_pct
+            )
             sec_diff = int(round(r_m["time_sec"] - sim_res["time_sec"]))
             t_s = int(round(r_m["time_sec"]))
             mm, ss = divmod(t_s, 60)
@@ -2961,29 +3098,32 @@ with tab_simulator:
   - **スタート45〜60分前**: **カフェイン {caffeine_mg} mg**（体重1kgあたり約3.5mg：RPE軽減＆中枢神経動員向上）＋ エネルギージェル1本（糖質30g）
 - **🚴‍♂️ レース中の補給量（予想タイム {time_formatted} / 推定消費 {race_kj} kJ）**:
   - **走行中の目標糖質摂取**: 合計 **{ingame_carbs_g} g**（マルトデキストリン＋フルクトース配合ドリンクまたはジェルを20〜25分ごとに分割摂取）
-- **🎯 科学的ペーシング鉄則（無酸素容量 W' = `{st.session_state.metrics['pdc'].get('w_prime_kj', 15.0) if st.session_state.metrics else 15.0} kJ` を温存する走り方）**:
-  - **序盤（最初の10分間）**: アドレナリンでオーバーペースになりやすいため、上限を **{round(effective_watts * 1.02)}W** 以下に厳格ロック（序盤にCPを超えるとW'が枯渇し中盤以降に乳酸が急増します）。
-  - **中盤（勾配変化区間）**: 勾配が緩む区間ほど空力（ドラフティング・エアロフォーム）を活かし、急勾配区間でも **{round(effective_watts * 1.06)}W** を超えないイーブンパワーを徹底。
-  - **終盤（ラスト3km〜ゴール）**: 残した無酸素容量（W'）を解放し、徐々に **{round(effective_watts * 1.08)}W → 全開スプリント** へビルドアップ！
+- **🎯 科学的ペーシング＆ドラフティング鉄則（無酸素容量 W' = `{st.session_state.metrics['pdc'].get('w_prime_kj', 15.0) if st.session_state.metrics else 15.0} kJ` を温存する走り方）**:
+  - **序盤（最初の10分間）**: アドレナリンでオーバーペースになりやすいため、上限を **{round(effective_watts * 1.02)}W** 以下に厳格ロック。同じ脚力帯のトレインを見つけたらツキイチ〜中盤に入り、単独比 **{saved_watts_vs_solo if sim_draft_pct > 0 else 12}W前後** の空気抵抗節約を狙いましょう。
+  - **中盤（平坦・緩斜面区間）**: 勾配が緩む区間（富士ヒルの1合目下・奥庭平坦など）は速度が上がり空気抵抗が2乗で増えるため、絶対に単独で風を受けずパック内で脚を休めること。
+  - **終盤（ラスト3km〜ゴール）**: パック内で温存した無酸素容量（W'）を解放し、徐々に **{round(effective_watts * 1.08)}W → 全開スプリント** へビルドアップ！
         """)
 
 
 # ==========================================
-# Tab 5: AIコーチ・チャット相談（永続記憶付き）
+# Tab 5: AIコーチ・チャット相談（永続記憶付き・入力欄最下部固定）
 # ==========================================
 with tab_chat:
     col_ch1, col_ch2 = st.columns([4, 1])
     with col_ch1:
-        st.caption("💬 過去の会話履歴・ライド評価・HRV/睡眠状態・CP/W'・怪我や病気の設定をすべて記憶した状態で相談できます。")
+        st.caption("💬 過去の会話履歴・ライド評価・HRV/睡眠状態・CP/W'・怪我や病気の設定をすべて記憶した状態で相談できます。（入力欄は常に画面最下部に固定されています）")
     with col_ch2:
         if st.button("🗑️ 会話履歴をクリア", use_container_width=True):
             st.session_state.messages = []
             save_memory()
             st.rerun()
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # メッセージ表示用コンテナを st.chat_input の上に配置することで、新規発言時も常に入力欄が最下部に位置する
+    chat_container = st.container()
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     if prompt := st.chat_input("例: 今日のHRVと睡眠スコア的に走っても大丈夫？ / 富士ヒルで65分を切るためにあと何を伸ばすべき？"):
         if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
@@ -2997,34 +3137,38 @@ with tab_chat:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
             })
             save_memory()
-            with st.chat_message("user"):
-                st.markdown(prompt)
+            with chat_container:
+                with st.chat_message("user"):
+                    st.markdown(prompt)
 
-            with st.chat_message("assistant"):
-                try:
-                    sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
-                    client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
-                    history_contents = [
-                        types.Content(
-                            role="user" if m["role"] == "user" else "model",
-                            parts=[types.Part.from_text(text=m["content"])]
+                with st.chat_message("assistant"):
+                    try:
+                        sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
+                        client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
+                        history_contents = [
+                            types.Content(
+                                role="user" if m["role"] == "user" else "model",
+                                parts=[types.Part.from_text(text=m["content"])]
+                            )
+                            for m in st.session_state.messages[-20:]
+                        ]
+                        reply = st.write_stream(
+                            stream_gemini_response(
+                                client_ai, selected_model, history_contents, sys_prompt,
+                                sarashina_key=sarashina_key, gemini_key=gemini_key
+                            )
                         )
-                        for m in st.session_state.messages[-20:]
-                    ]
-                    reply = st.write_stream(
-                        stream_gemini_response(
-                            client_ai, selected_model, history_contents, sys_prompt,
-                            sarashina_key=sarashina_key, gemini_key=gemini_key
-                        )
-                    )
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": reply,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    })
-                    save_memory()
-                except Exception as e:
-                    show_ai_error("チャット応答エラー", e, selected_model)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": reply,
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                        })
+                        save_memory()
+                    except Exception as e:
+                        show_ai_error("チャット応答エラー", e, selected_model)
+
+    with chat_container:
+        st.markdown('<div style="height: 80px;"></div>', unsafe_allow_html=True)
 
 
 # ==========================================
