@@ -339,13 +339,14 @@ class IntervalsClient:
         res.raise_for_status()
         return res.json()
 
-    def post_workout(self, name: str, description: str, target_date: str) -> dict:
+    def post_workout(self, name: str, description: str, target_date: str, ftp: int = 250) -> dict:
         url = f"{self.BASE_URL}/athlete/{self.athlete_id}/events"
+        normalized_desc = normalize_intervals_workout_code(description, ftp=ftp)
         payload = {
             "category": "WORKOUT",
             "start_date_local": f"{target_date}T00:00:00",
             "name": name,
-            "description": description,
+            "description": normalized_desc,
             "type": "Ride"
         }
         res = requests.post(url, auth=self.auth, json=payload, timeout=10)
@@ -415,81 +416,226 @@ class IntervalsClient:
 # ==========================================
 # 3. ワークアウト解析・科学指標計算・ZWO出力・チャート生成
 # ==========================================
-def parse_intervals_workout(workout_text: str, ftp: int):
+def _parse_single_step_clause(clause: str, ftp: int) -> dict | None:
+    """単一ステップ文字列（例: '2m 95% 90rpm'）から秒数・相対パワー・ケイデンスを抽出"""
+    s = clause.strip().lstrip("-*•").strip()
+    if not s:
+        return None
+
+    dur_sec = 0
+    m_h = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|時間)\b", s, re.IGNORECASE)
+    m_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m(?:in(?:ute)?s?)?(?!s|p|a)|分)", s, re.IGNORECASE)
+    m_s = re.search(r"(\d+(?:\.\d+)?)\s*(?:s(?:ec(?:ond)?s?)?(?!e|t)|秒)", s, re.IGNORECASE)
+    if m_h:
+        dur_sec += int(round(float(m_h.group(1)) * 3600))
+    if m_m:
+        dur_sec += int(round(float(m_m.group(1)) * 60))
+    if m_s:
+        dur_sec += int(round(float(m_s.group(1))))
+
+    if dur_sec == 0:
+        return None
+
+    m_p_range = re.search(r"(\d+(?:\.\d+)?)\s*[-~〜]\s*(\d+(?:\.\d+)?)\s*%", s)
+    m_p = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
+    m_w_range = re.search(r"(\d+(?:\.\d+)?)\s*[-~〜]\s*(\d+(?:\.\d+)?)\s*w\b", s, re.IGNORECASE)
+    m_w = re.search(r"(\d+(?:\.\d+)?)\s*w\b", s, re.IGNORECASE)
+
+    if m_p_range:
+        p_low = float(m_p_range.group(1)) / 100.0
+        p_high = float(m_p_range.group(2)) / 100.0
+        power_rel = (p_low + p_high) / 2.0
+    elif m_p:
+        power_rel = float(m_p.group(1)) / 100.0
+    elif m_w_range and ftp > 0:
+        w_low = float(m_w_range.group(1))
+        w_high = float(m_w_range.group(2))
+        power_rel = ((w_low + w_high) / 2.0) / float(ftp)
+    elif m_w and ftp > 0:
+        power_rel = float(m_w.group(1)) / float(ftp)
+    else:
+        power_rel = 0.65
+
+    m_cad_range = re.search(r"(\d+)\s*[-~〜]\s*(\d+)\s*rpm", s, re.IGNORECASE)
+    m_cad = re.search(r"(\d+)\s*rpm", s, re.IGNORECASE)
+    if m_cad_range:
+        cadence = int(round((int(m_cad_range.group(1)) + int(m_cad_range.group(2))) / 2))
+    elif m_cad:
+        cadence = int(m_cad.group(1))
+    else:
+        cadence = None
+
+    # 正規化された標準1行ステップ表記を生成 (例: "- 2m 95% 90rpm" or "- 30s 115% 105rpm")
+    if dur_sec % 60 == 0:
+        dur_str = f"{dur_sec // 60}m"
+    elif dur_sec > 60:
+        dur_str = f"{dur_sec // 60}m{dur_sec % 60}s"
+    else:
+        dur_str = f"{dur_sec}s"
+    pct_int = int(round(power_rel * 100))
+    cad_str = f" {cadence}rpm" if cadence else ""
+    canonical_line = f"- {dur_str} {pct_int}%{cad_str}"
+
+    return {
+        "duration": dur_sec,
+        "power": round(power_rel, 3),
+        "cadence": cadence,
+        "raw": canonical_line,
+    }
+
+
+def _expand_bullet_line(step_line: str, ftp: int) -> list[dict]:
+    """
+    1行の箇条書きステップを解析し、インライン反復やスラッシュ区切りを展開してステップ配列を返す。
+    対応例:
+      - "- 20m 60% 90rpm"
+      - "- 3x 30s 115% 105rpm / 30s 50% 85rpm"
+      - "- 3x (2m 95% 90rpm / 1m 105% 95rpm)"
+      - "- (2m 95% / 1m 105%) x 3"
+    """
+    body = step_line.strip()
+    body = re.sub(r"^[-*•]\s*", "", body).strip()
+    if not body:
+        return []
+
+    inline_rep = 1
+    rest = body
+
+    # パターン1: 先頭に "3x ..." または "3 x ..."
+    m_pre = re.match(r"^(\d+)\s*x\b\s*(.+)$", rest, re.IGNORECASE)
+    if m_pre:
+        inline_rep = max(1, int(m_pre.group(1)))
+        rest = m_pre.group(2).strip()
+    else:
+        # パターン2: "(...) x 3" または "(...) 3x"
+        m_suf = re.match(r"^\((.+)\)\s*(?:x\s*(\d+)|(\d+)\s*x)\b.*$", rest, re.IGNORECASE)
+        if m_suf:
+            inline_rep = max(1, int(m_suf.group(2) or m_suf.group(3)))
+            rest = m_suf.group(1).strip()
+
+    # 外側の括弧 "(2m 95% 90rpm / 1m 105% 95rpm)" を除去
+    m_paren = re.match(r"^\(([^()]+)\)(.*)$", rest)
+    if m_paren:
+        rest = m_paren.group(1).strip()
+
+    # スラッシュ "/" や "+" や ";" や "->" で複合ステップを分割 (ただし W/kg は分割しない)
+    sub_clauses = re.split(r"\s*(?:(?<!w)/(?!kg)|／|\+|＋|;|->|→)\s*", rest, flags=re.IGNORECASE)
+    parsed_sub_steps = []
+    for clause in sub_clauses:
+        parsed = _parse_single_step_clause(clause, ftp)
+        if parsed:
+            parsed_sub_steps.append(parsed)
+
+    # もし複合分割でうまく取れなかった場合は行全体でフォールバック解析
+    if not parsed_sub_steps:
+        fallback = _parse_single_step_clause(rest, ftp)
+        if fallback:
+            parsed_sub_steps.append(fallback)
+        else:
+            parsed_sub_steps.append({
+                "duration": 300,
+                "power": 0.65,
+                "cadence": None,
+                "raw": f"- 5m 65%",
+            })
+
+    expanded = []
+    for _ in range(inline_rep):
+        for stp in parsed_sub_steps:
+            expanded.append(dict(stp))
+    return expanded
+
+
+def _parse_workout_sections(workout_text: str, ftp: int) -> list[tuple[int, list[dict], str]]:
+    """ワークアウト文字列をセクション単位 (repeat, expanded_steps_in_one_set, section_name) に分解"""
     lines = workout_text.strip().splitlines()
     raw_sections = []
     current_repeat = 1
     current_block = []
-    current_sec_name = "Main"
+    current_sec_name = "Main Set"
 
     for line in lines:
         s = line.strip()
-        if not s:
+        if not s or s.startswith("```"):
             if current_block:
                 raw_sections.append((current_repeat, current_block, current_sec_name))
                 current_block = []
                 current_repeat = 1
             continue
 
-        if not s.startswith("-"):
+        is_bullet = bool(re.match(r"^[-*•]\s*", s))
+        # 行頭に '-' が無くても、先頭が '10m 60%' のような純粋なステップ行か判定
+        looks_like_step = bool(
+            re.match(r"^(?:\d+\s*x\s*)?\(?\d+(?:\.\d+)?\s*(?:h|hr|m|min|s|sec|分|秒)\b", s, re.IGNORECASE)
+            and re.search(r"(?:\d+\s*%|\d+\s*w\b)", s, re.IGNORECASE)
+        )
+
+        if not is_bullet and not looks_like_step:
             if current_block:
                 raw_sections.append((current_repeat, current_block, current_sec_name))
                 current_block = []
-            m_rep = re.search(r"(\d+)\s*x", s, re.IGNORECASE)
-            current_repeat = int(m_rep.group(1)) if m_rep else 1
-            if "warm" in s.lower():
-                current_sec_name = "Warmup"
-            elif "cool" in s.lower():
-                current_sec_name = "Cooldown"
+                current_repeat = 1
+
+            # 直前が空ブロックで "3x" だけの行が来た場合は前のセクション名に反復回数を付与
+            m_only_rep = re.fullmatch(r"\(?(\d+)\s*x\)?", s, re.IGNORECASE)
+            if m_only_rep and not current_block:
+                current_repeat = max(1, int(m_only_rep.group(1)))
+                if f"{current_repeat}x" not in current_sec_name.lower():
+                    current_sec_name = f"{current_sec_name} {current_repeat}x"
+                continue
+
+            m_rep = re.search(r"(\d+)\s*x\b", s, re.IGNORECASE) or re.search(r"(\d+)\s*回", s)
+            current_repeat = max(1, int(m_rep.group(1))) if m_rep else 1
+            if "warm" in s.lower() or "ウォーム" in s or "アップ" in s:
+                current_sec_name = "Warmup" if current_repeat == 1 else f"Warmup {current_repeat}x"
+            elif "cool" in s.lower() or "クール" in s or "ダウン" in s:
+                current_sec_name = "Cooldown" if current_repeat == 1 else f"Cooldown {current_repeat}x"
             else:
                 current_sec_name = s
         else:
-            current_block.append(s)
+            current_block.extend(_expand_bullet_line(s, ftp))
 
     if current_block:
         raw_sections.append((current_repeat, current_block, current_sec_name))
 
+    return raw_sections
+
+
+def normalize_intervals_workout_code(workout_text: str, ftp: int = 250) -> str:
+    """
+    AIが生成したワークアウト記法（インラインの '3x (2m 95% / 1m 105%)' や '/ 30s 50%' 等を含む）を、
+    Intervals.icu カレンダーおよび MyWhoosh が100%確実に解釈できる標準1行1ステップ記法へ正規化する。
+    """
+    sections = _parse_workout_sections(workout_text, ftp)
+    if not sections:
+        return workout_text.strip()
+
+    out_blocks = []
+    for rep, block_steps, sec_name in sections:
+        header = sec_name.strip()
+        if rep > 1 and not re.search(r"(\d+)\s*x\b", header, re.IGNORECASE):
+            header = f"{header} {rep}x"
+        lines = [header]
+        for stp in block_steps:
+            lines.append(stp["raw"])
+        out_blocks.append("\n".join(lines))
+
+    return "\n\n".join(out_blocks)
+
+
+def parse_intervals_workout(workout_text: str, ftp: int):
+    raw_sections = _parse_workout_sections(workout_text, ftp)
+
     steps = []
-    for rep, block, sec_name in raw_sections:
+    for rep, block_steps, sec_name in raw_sections:
         for _ in range(rep):
-            for step_line in block:
-                dur_sec = 0
-                m_h = re.search(r"(\d+(?:\.\d+)?)\s*h", step_line, re.IGNORECASE)
-                m_m = re.search(r"(\d+(?:\.\d+)?)\s*m(?!s|p)", step_line, re.IGNORECASE)
-                m_s = re.search(r"(\d+(?:\.\d+)?)\s*s", step_line, re.IGNORECASE)
-                if m_h:
-                    dur_sec += int(float(m_h.group(1)) * 3600)
-                if m_m:
-                    dur_sec += int(float(m_m.group(1)) * 60)
-                if m_s:
-                    dur_sec += int(float(m_s.group(1)))
-                if dur_sec == 0:
-                    dur_sec = 300
-
-                m_p_range = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*%", step_line)
-                m_p = re.search(r"(\d+(?:\.\d+)?)\s*%", step_line)
-                m_w = re.search(r"(\d+(?:\.\d+)?)\s*w\b", step_line, re.IGNORECASE)
-
-                if m_p_range:
-                    p_low = float(m_p_range.group(1)) / 100.0
-                    p_high = float(m_p_range.group(2)) / 100.0
-                    power_rel = (p_low + p_high) / 2.0
-                elif m_p:
-                    power_rel = float(m_p.group(1)) / 100.0
-                elif m_w and ftp > 0:
-                    power_rel = float(m_w.group(1)) / float(ftp)
-                else:
-                    power_rel = 0.65
-
-                m_cad = re.search(r"(\d+)\s*rpm", step_line, re.IGNORECASE)
-                cadence = int(m_cad.group(1)) if m_cad else None
-
+            for stp in block_steps:
                 steps.append({
                     "section": sec_name,
-                    "duration": dur_sec,
-                    "power": round(power_rel, 3),
-                    "cadence": cadence,
-                    "raw": step_line
+                    "duration": stp["duration"],
+                    "power": stp["power"],
+                    "cadence": stp["cadence"],
+                    "raw": stp["raw"],
                 })
 
     timeline = []
@@ -1489,14 +1635,35 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
 【🧠 AIコーチの長期記憶（過去のやり取り・メニュー・ライド評価履歴）】
 {memory_context}
 
-【Intervals.icu ワークアウト記法の書式ルール】
+【Intervals.icu ワークアウト記法の絶対厳守ルール（説明文との100%一致・1行1ステップ厳守）】
+1. **説明文とワークアウトコードの完全一致**:
+   - 本文の「メニュー詳細」で解説した各セクションの時間・セット数・反復回数・強度（%FTPおよびW）・レスト時間・ケイデンスと、`workout` コードブロック内の記述は **1秒・1%の狂いもなく100%完全に一致** させること。
+   - 指定された練習可能時間（例: 60分、120分など）と、全ステップ（Warmup + Main Set × 反復回数 + Sub Set + Cooldown）の合計時間が必ずピタリ一致するように検算してから出力すること。
+2. **1行につき必ず1ステップのみ記述（スラッシュ `/` や入れ子の `3x (...)` は禁止）**:
+   - `- 3x (2m 95% / 1m 105%)` や `- 3x 30s 115% / 30s 50%` のように1行の `-` に複数ステップやスラッシュ `/`、括弧 `(...)` を詰め込む記法は **絶対に使用禁止**。
+   - 必ず **`- 時間 強度% ケイデンスrpm` を1行に1ステップずつ改行して記述** すること。
+   - 反復（リピート）を使う場合は、セクション見出し行（例: `Warmup Spins 3x` や `Main Set 3x`）に回数を書き、その直下に1ステップ1行で箇条書きし、反復ブロックの終わりには必ず**空行**を入れること。
+   - オーバーアンダー等で1セット内に複数回の切り替えがある場合は、各ステップを1行ずつ展開して記述すること。
+
+【正しい記述例】
 Warmup
-- 10m 50% 90rpm
+- 15m 60% 90rpm
+
+Warmup Spins 3x
+- 30s 115% 105rpm
+- 30s 50% 85rpm
+
 Main Set 3x
-- 8m 98%
-- 4m 55%
+- 2m 95% 90rpm
+- 1m 105% 95rpm
+- 2m 95% 90rpm
+- 1m 105% 95rpm
+- 2m 95% 90rpm
+- 1m 105% 95rpm
+- 6m 55% 85rpm
+
 Cooldown
-- 10m 45%
+- 10m 50% 85rpm
 """
 
 
@@ -2718,17 +2885,20 @@ with tab_daily:
             sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
             user_req = f"""
 以下の条件で、本日実施すべき最適なワークアウトを1つ作成してください。
-- 使用可能時間: {avail_minutes} 分
+- 使用可能時間: {avail_minutes} 分（※全ステップの合計時間が必ず {avail_minutes} 分になるように設計・検算すること）
 - 環境: {indoor_mode}
 - 体調・メニュー方針: {rpe_feeling}
 - 戦術フォーカス指定: {tactical_focus}
 - 本日の補足メモ: {today_note or '特になし'}
 - 外的要因・制限設定: {ext_status} / 強度上限: {ext_intensity_cap} / 詳細: {ext_detail or 'なし'}
 
-【出力構成】
+【出力構成と絶対厳守事項】
 1. **本日のコンディション判定とメニューの科学的狙い**（最新のHRV・睡眠スコア・安静時心拍・TSB・RampRate、CP/W'やパワーカーブ弱点、外的要因や過去の記憶をどう統合したか）
-2. **メニュー詳細とペダリング・補給アドバイス**（各セクションの目標ワット数 `{ftp}W` 基準の実数値、指定ケイデンス、走行中の糖質・水分摂取のポイント）
-3. **Intervals.icu カレンダー登録用のワークアウトコードブロック**（必ず ```workout から始めて記述すること。完全休養を推奨する場合はコードブロックは省略可）
+2. **メニュー詳細とペダリング・補給アドバイス**（各セクションの目標ワット数 `{ftp}W` 基準の実数値、指定ケイデンス、走行中の糖質・水分摂取のポイント。※後述の `workout` コードブロックと時間・セット数・強度を100%一致させること）
+3. **Intervals.icu カレンダー登録用のワークアウトコードブロック**
+   - 必ず ```workout から始めて記述すること（完全休養を推奨する場合は省略可）。
+   - **禁止事項**: `- 3x (2m 95% / 1m 105%)` や `- 30s 115% / 30s 50%` のように1行に `/` や括弧 `(...)` を使って複数ステップをまとめないこと。必ず **1行につき1ステップ（例: `- 2m 95% 90rpm`）** で記述すること。
+   - **時間の一致**: コードブロック内の全ステップの合計時間（反復回数やレスト含む）が、説明文および指定時間（{avail_minutes}分）と完全に一致していることを確認すること。
 """
             try:
                 client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
@@ -2740,10 +2910,22 @@ with tab_daily:
                             sarashina_key=sarashina_key, gemini_key=gemini_key
                         )
                     )
-                    st.session_state.generated_workout = response_text
+                    m_code = re.search(r"```workout[^\n]*\n(.*?)```", response_text, re.DOTALL)
+                    if m_code:
+                        raw_code = m_code.group(1).strip()
+                        norm_code = normalize_intervals_workout_code(raw_code, ftp)
+                        response_text = re.sub(
+                            r"```workout[^\n]*\n.*?```",
+                            f"```workout\n{norm_code}\n```",
+                            response_text,
+                            count=1,
+                            flags=re.DOTALL,
+                        )
+                        w_code_extracted = norm_code
+                    else:
+                        w_code_extracted = ""
 
-                    m_code = re.search(r"```workout\n(.*?)```", response_text, re.DOTALL)
-                    w_code_extracted = m_code.group(1).strip() if m_code else ""
+                    st.session_state.generated_workout = response_text
                     st.session_state.daily_workout_history.append({
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "title": f"{tactical_focus[:12]} ({avail_minutes}min)",
@@ -2756,9 +2938,10 @@ with tab_daily:
                 show_ai_error("AI生成エラー", e, selected_model)
 
     if st.session_state.generated_workout:
-        match = re.search(r"```workout\n(.*?)```", st.session_state.generated_workout, re.DOTALL)
+        match = re.search(r"```workout[^\n]*\n(.*?)```", st.session_state.generated_workout, re.DOTALL)
         if match:
-            workout_code = match.group(1).strip()
+            raw_workout_code = match.group(1).strip()
+            workout_code = normalize_intervals_workout_code(raw_workout_code, ftp)
             steps, df_chart = parse_intervals_workout(workout_code, ftp)
             w_stats = calculate_workout_stats(steps, ftp)
 
@@ -2785,7 +2968,7 @@ with tab_daily:
 
             col_p1, col_p2, col_p3 = st.columns([2, 1, 1])
             with col_p1:
-                w_name = st.text_input("登録名", value=f"AI Coach ({avail_minutes}min)")
+                w_name = st.text_input("登録名", value=f"AI Coach ({w_stats['total_min'] if w_stats else avail_minutes}min)")
             with col_p2:
                 w_date = st.date_input("登録日", value=datetime.now().date())
             with col_p3:
@@ -2801,14 +2984,20 @@ with tab_daily:
             if st.button("🚀 Intervals.icu カレンダーに登録", use_container_width=True):
                 try:
                     client = IntervalsClient(athlete_id, intervals_key)
-                    client.post_workout(w_name, workout_code, w_date.strftime("%Y-%m-%d"))
+                    client.post_workout(w_name, workout_code, w_date.strftime("%Y-%m-%d"), ftp=ftp)
                     st.success(f"✅ {w_date} のカレンダーに『{w_name}』を登録しました！")
                 except Exception as e:
                     st.error(f"登録エラー: {e}")
 
         st.divider()
         with st.container():
-            st.markdown(st.session_state.generated_workout)
+            display_md = re.sub(
+                r"```workout[^\n]*\n(.*?)```",
+                lambda m: f"```workout\n{normalize_intervals_workout_code(m.group(1).strip(), ftp)}\n```",
+                st.session_state.generated_workout,
+                flags=re.DOTALL,
+            )
+            st.markdown(display_md)
 
     if st.session_state.daily_workout_history:
         st.divider()
@@ -2851,7 +3040,8 @@ with tab_weekly:
 - ユーザーの要望メモ: {weekly_note}
 - 平日の上限時間: {weekday_hours}時間 / 休日の上限時間: {weekend_hours}時間
 - 現在のHRV・睡眠スコアによるレディネス状態、TSB、および外的要因（{ext_status} / 上限:{ext_intensity_cap} / {ext_detail}）を厳密に考慮し、ポラライズドまたはピラミッド型のメリハリある7日間にすること。
-- 練習日の `workout_code` には、Intervals.icuのカレンダーでそのままグラフ化される正確なワークアウト記法（Warmup / Main Set / Cooldown、`- 10m 90%` 等の形式）を記述すること。
+- 練習日の `workout_code` には、Intervals.icuのカレンダーでそのままグラフ化される正確な1行1ステップ記法（Warmup / Main Set / Cooldown、`- 10m 90% 90rpm` 等の形式。1行に `/` や括弧 `(...)` を使った複合記述は禁止）を記述すること。
+- 各日の `rationale`（説明文）、`duration_min`（予定時間）、`target_tss`（目標TSS）と、`workout_code` の全ステップ合計時間・強度が100%一致するように作成すること。
 """
             try:
                 with st.spinner(f"AIコーチ（{selected_model}）が7日間のメニューを構造化生成中..."):
@@ -2870,6 +3060,15 @@ with tab_weekly:
                         sys_prompt=sys_prompt,
                     )
                     plan_obj = json.loads(response.text)
+                    for d_item in plan_obj.get("days", []):
+                        if not d_item.get("is_rest_day") and d_item.get("workout_code"):
+                            norm_wk = normalize_intervals_workout_code(d_item["workout_code"], ftp)
+                            d_item["workout_code"] = norm_wk
+                            stps_d, _ = parse_intervals_workout(norm_wk, ftp)
+                            st_d = calculate_workout_stats(stps_d, ftp)
+                            if st_d:
+                                d_item["duration_min"] = st_d["total_min"]
+                                d_item["target_tss"] = st_d["tss"]
                     st.session_state.weekly_plan = plan_obj
                     st.session_state.weekly_plan_history.append({
                         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -2882,6 +3081,17 @@ with tab_weekly:
 
     if st.session_state.weekly_plan:
         plan = st.session_state.weekly_plan
+        # 既存保存プランも含め、workout_codeから正確な時間・TSS・正規化コードを算出して表示を一致させる
+        for d_item in plan.get("days", []):
+            if not d_item.get("is_rest_day") and d_item.get("workout_code"):
+                norm_wk = normalize_intervals_workout_code(d_item["workout_code"], ftp)
+                d_item["workout_code"] = norm_wk
+                stps_d, _ = parse_intervals_workout(norm_wk, ftp)
+                st_d = calculate_workout_stats(stps_d, ftp)
+                if st_d:
+                    d_item["duration_min"] = st_d["total_min"]
+                    d_item["target_tss"] = st_d["tss"]
+
         total_wk_tss = sum(d.get("target_tss", 0) for d in plan.get("days", []))
         total_wk_min = sum(d.get("duration_min", 0) for d in plan.get("days", []))
         st.success(f"✨ 週間プラン表示中 — 週間合計予定時間: **{round(total_wk_min/60, 1)}時間 ({total_wk_min}分)** ／ 週間合計目標TSS: **{total_wk_tss} TSS**")
@@ -2921,7 +3131,8 @@ with tab_weekly:
                             client.post_workout(
                                 name=d["title"],
                                 description=d["workout_code"].strip(),
-                                target_date=d["date"]
+                                target_date=d["date"],
+                                ftp=ftp,
                             )
                             posted_count += 1
                         except Exception as e:
