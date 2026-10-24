@@ -15,6 +15,7 @@ from google import genai
 from google.genai import types
 import altair as alt
 import time
+import random
 
 CONFIG_FILE = "config.json"
 CACHE_FILE = "intervals_cache.json"
@@ -44,6 +45,8 @@ DEFAULT_CONFIG = {
     "ext_status": "なし（通常通り）",
     "ext_detail": "",
     "ext_intensity_cap": "制限なし（コンディションに応じる）",
+    # AIコーチの厳しさレベル (1〜5)
+    "coach_strictness": 3,
     # 公開設定
     "public_default_guest": False,
 }
@@ -1546,6 +1549,277 @@ def build_memory_context_str() -> str:
     return "\n\n".join(parts) if parts else "（過去の履歴データはまだありません）"
 
 
+# ==========================================
+# 4-B. AIコーチ厳しさレベル・計画遵守率・PMC将来予測（ピーキング）
+# ==========================================
+COACH_STRICTNESS_LEVELS = {
+    1: {
+        "label": "Lv1 😊 褒めて伸ばす",
+        "desc": "モチベーション最優先。できた点を具体的に褒め、改善点は1つだけ優しく提案。",
+        "prompt": (
+            "- 口調: 温かく前向き。共感を示し、できたことを最初に具体的な数値付きで褒める（褒め:指摘 ≒ 8:2）。\n"
+            "- 計画未達・サボり: 責めずに背景（疲労・多忙）へ共感し、次に繋がる『小さな一歩』を1つだけ提案する。\n"
+            "- 負荷設計: レディネス上許容される範囲の『控えめ側』を選び、継続性と楽しさを重視する。\n"
+            "- 評価・採点: 甘め。改善点は最大1つに絞る。"
+        ),
+    },
+    2: {
+        "label": "Lv2 🙂 やさしく丁寧",
+        "desc": "丁寧語で理由をしっかり説明。改善点は2つまで。",
+        "prompt": (
+            "- 口調: 丁寧語で穏やか。良い点を先に伝えたうえで課題を説明する（褒め:指摘 ≒ 6:4）。\n"
+            "- 計画未達: 原因を一緒に整理し、無理のない修正案を提示する。\n"
+            "- 負荷設計: 許容範囲の中央〜やや控えめ。\n"
+            "- 評価・採点: やや甘め。改善点は2つまで、理由を生理学的に分かりやすく説明。"
+        ),
+    },
+    3: {
+        "label": "Lv3 🧑‍🏫 標準プロコーチ",
+        "desc": "客観的・データドリブン。良い点と課題を同等に伝えるバランス型。",
+        "prompt": (
+            "- 口調: 客観的・論理的・データドリブン。良い点と課題を同じ比重で伝える。\n"
+            "- 計画未達: 事実（予定TSS vs 実績TSS）を淡々と示し、週内での再配分案を提示する。\n"
+            "- 負荷設計: レディネスとフェーズに対して標準的な負荷。\n"
+            "- 評価・採点: 公平。課題は優先度順に提示。"
+        ),
+    },
+    4: {
+        "label": "Lv4 😤 厳しめ（言い訳無用）",
+        "desc": "端的・断定口調。未達やミスは数値で指摘し、是正策と期限を課す。",
+        "prompt": (
+            "- 口調: 端的・断定的。前置きや過度な共感は省く。褒めるのは客観的に優れた成果のみ（褒め:指摘 ≒ 3:7）。\n"
+            "- 計画未達・ペース配分ミス・補給不足: 数値で明確に指摘し、具体的な是正策と期限（例: 今週土曜までに〜）を課す。\n"
+            "- 言い訳（『忙しかった』等）には、その可処分時間内で実行可能だった代替メニュー（例: 45分のSST 2x12分）を示して反論する。\n"
+            "- 負荷設計: レディネス上許容される範囲の『上側』を選ぶ。\n"
+            "- 評価・採点: 辛め。目標との差を必ず数値で示す。"
+        ),
+    },
+    5: {
+        "label": "Lv5 🔥 鬼コーチ（WorldTour DS級）",
+        "desc": "妥協ゼロ。目標とのギャップを冷徹に突きつけ、毎回『必達の宿題』を課す。",
+        "prompt": (
+            "- 口調: 極めて厳格・簡潔な命令口調。妥協や慰めは一切しない。ただし人格否定・侮辱・罵倒は厳禁で、批判は『行動と数値』のみに向けること。\n"
+            "- 冒頭で必ず『目標とのギャップ』を数値で突きつける（例: 目標PWRまで残り+0.30W/kg、現在のCTL推移ではレースまでに到達不能、等）。\n"
+            "- 計画遵守率が100%未満なら最初に指摘し、未実施セッションの埋め合わせ方針を命令する。\n"
+            "- 褒め言葉は原則なし。自己ベスト更新など客観的成果のみ一言だけ認める。\n"
+            "- 負荷設計: 安全制約の範囲内で許容される『上限ぎりぎり』を攻める。\n"
+            "- 各回答の最後に必ず『📋 次回までの必達タスク』を3つ以内の箇条書きで課す。"
+        ),
+    },
+}
+
+
+def get_strictness_level(value) -> int:
+    """設定値（int / 文字列）を 1〜5 の厳しさレベルに正規化"""
+    try:
+        if isinstance(value, str):
+            m = re.search(r"(\d)", value)
+            value = int(m.group(1)) if m else 3
+        return min(5, max(1, int(value)))
+    except Exception:
+        return 3
+
+
+def build_coach_persona_prompt(level) -> str:
+    lv = get_strictness_level(level)
+    info = COACH_STRICTNESS_LEVELS[lv]
+    return f"""【🎚️ AIコーチの厳しさレベル: {info['label']}（5段階中 {lv}）】
+{info['prompt']}
+- ⚠️ 絶対ルール: 厳しさレベルは『口調・要求水準・説明責任の追及度』を調整するものです。HRV/睡眠によるレディネス低下、怪我・病気・外的要因の制限、過トレーニング兆候（TSB < -30、Ramp Rate > 8/週、HRVの連日低下など）がある場合は、どのレベルであっても安全と回復を最優先して休養・強度ダウンを指示してください（厳しいレベルでは『休むのも練習だ。今日は走るな』のように厳しく休養を命じる形で表現すること）。"""
+
+
+def compute_plan_compliance(plan: dict, activities: list, today=None) -> dict:
+    """週間プラン（予定）と Intervals.icu の実績ライドを日付単位で突合し、計画遵守率を算出"""
+    if not plan or not isinstance(plan, dict) or not plan.get("days"):
+        return {}
+    today = today or datetime.now().date()
+
+    act_by_date = {}
+    for a in activities or []:
+        ds = str(a.get("日付", ""))[:10]
+        if not ds:
+            continue
+        agg = act_by_date.setdefault(ds, {"tss": 0, "min": 0, "names": []})
+        agg["tss"] += int(a.get("TSS") or 0)
+        agg["min"] += int(a.get("時間(分)") or 0)
+        agg["names"].append(str(a.get("ワークアウト名", "Ride")))
+
+    rows, scores = [], []
+    planned_tss_to_date, actual_tss_to_date = 0, 0
+    for d in plan["days"]:
+        ds = str(d.get("date", ""))[:10]
+        try:
+            dt = datetime.strptime(ds, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        is_rest = bool(d.get("is_rest_day"))
+        p_tss = int(d.get("target_tss") or 0) if not is_rest else 0
+        p_min = int(d.get("duration_min") or 0) if not is_rest else 0
+        act = act_by_date.get(ds, {"tss": 0, "min": 0, "names": []})
+        a_tss, a_min = act["tss"], act["min"]
+        score = None
+
+        if dt > today:
+            status = "📅 予定"
+        elif dt < today - timedelta(days=39):
+            status = "— 同期範囲外"
+        elif is_rest:
+            if a_tss <= 30:
+                status, score = "✅ 休養遵守", 1.0
+            else:
+                status, score = "⚠️ 休養日に高負荷", 0.5
+        elif dt == today and a_tss == 0:
+            status = "⏳ 本日予定"
+        else:
+            ratio = (a_tss / p_tss) if p_tss > 0 else (1.0 if a_tss > 0 else 0.0)
+            if a_tss == 0:
+                status, score = "❌ 未実施", 0.0
+            elif ratio < 0.5:
+                status = "🔴 大幅未達"
+            elif ratio < 0.85:
+                status = "🟡 一部達成"
+            elif ratio <= 1.15:
+                status = "✅ 達成"
+            else:
+                status = "⚠️ やり過ぎ"
+            if a_tss > 0:
+                score = 1.0 if 0.85 <= ratio <= 1.15 else max(0.0, 1.0 - abs(ratio - 1.0))
+
+        if score is not None:
+            scores.append(score)
+            planned_tss_to_date += p_tss
+            actual_tss_to_date += a_tss
+
+        rows.append({
+            "日付": ds,
+            "曜日": d.get("day_label", ""),
+            "予定メニュー": d.get("title", ""),
+            "予定(分)": p_min,
+            "予定TSS": p_tss,
+            "実績(分)": a_min,
+            "実績TSS": a_tss,
+            "実績ライド": " / ".join(act["names"])[:60] if act["names"] else "—",
+            "判定": status,
+        })
+
+    return {
+        "rows": rows,
+        "pct": round(sum(scores) / len(scores) * 100) if scores else None,
+        "evaluated_days": len(scores),
+        "planned_tss_to_date": planned_tss_to_date,
+        "actual_tss_to_date": actual_tss_to_date,
+    }
+
+
+def build_compliance_prompt_str(comp: dict) -> str:
+    if not comp or comp.get("pct") is None:
+        return "（評価対象となる過去の予定日がまだありません）"
+    lines = [
+        f"- 計画遵守率: {comp['pct']}%（評価済み {comp['evaluated_days']}日）",
+        f"- 予定TSS累計 {comp['planned_tss_to_date']} に対し 実績TSS累計 {comp['actual_tss_to_date']}",
+    ]
+    for r in comp["rows"]:
+        if r["判定"] not in ("📅 予定", "— 同期範囲外"):
+            lines.append(f"- {r['日付']}({r['曜日']}) 予定『{r['予定メニュー']}』TSS{r['予定TSS']} → 実績TSS{r['実績TSS']} : {r['判定']}")
+    return "\n".join(lines)
+
+
+def project_pmc_to_race(ctl0: float, atl0: float, days_to_race: int, weekly_tss: float,
+                        weekly_increase_pct: float, taper_days: int, taper_cut_pct: float,
+                        start_date=None) -> dict:
+    """Banister型インパルス応答（CTL τ=42日 / ATL τ=7日）でレース当日朝までのCTL/ATL/TSBを予測"""
+    start_date = start_date or datetime.now().date()
+    k_ctl = 1 - math.exp(-1 / 42)
+    k_atl = 1 - math.exp(-1 / 7)
+    ctl, atl = float(ctl0), float(atl0)
+    rows = [{"date": start_date, "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(ctl - atl, 1), "tss": None, "phase": "現在"}]
+    taper_start_idx = max(1, days_to_race - taper_days)
+    pre_taper_week_tss = weekly_tss
+    peak_ctl = ctl
+    max_weekly_ramp = 0.0
+    ctl_history = [ctl]
+
+    for i in range(1, days_to_race):
+        if i < taper_start_idx:
+            week_idx = (i - 1) // 7
+            week_tss = weekly_tss * ((1 + weekly_increase_pct / 100.0) ** week_idx)
+            pre_taper_week_tss = week_tss
+            daily_tss = week_tss / 7.0
+            phase = "ビルド"
+        else:
+            daily_tss = (pre_taper_week_tss / 7.0) * (1 - taper_cut_pct / 100.0)
+            phase = "テーパー"
+        ctl += (daily_tss - ctl) * k_ctl
+        atl += (daily_tss - atl) * k_atl
+        peak_ctl = max(peak_ctl, ctl)
+        ctl_history.append(ctl)
+        if len(ctl_history) > 7:
+            max_weekly_ramp = max(max_weekly_ramp, ctl_history[-1] - ctl_history[-8])
+        rows.append({
+            "date": start_date + timedelta(days=i),
+            "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(ctl - atl, 1),
+            "tss": round(daily_tss), "phase": phase,
+        })
+
+    race_dt = start_date + timedelta(days=max(days_to_race, 0))
+    rows.append({"date": race_dt, "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(ctl - atl, 1), "tss": None, "phase": "🏁 レース当日朝"})
+    return {
+        "rows": rows,
+        "race_ctl": round(ctl, 1),
+        "race_atl": round(atl, 1),
+        "race_tsb": round(ctl - atl, 1),
+        "peak_ctl": round(peak_ctl, 1),
+        "ctl_drop_pct": round((peak_ctl - ctl) / peak_ctl * 100, 1) if peak_ctl > 0 else 0.0,
+        "max_weekly_ramp": round(max_weekly_ramp, 1),
+        "pre_taper_week_tss": round(pre_taper_week_tss),
+    }
+
+
+def optimize_taper(ctl0: float, atl0: float, days_to_race: int, weekly_tss: float,
+                   weekly_increase_pct: float, tsb_lo: float, tsb_hi: float):
+    """目標TSB帯に収まり、かつレース当日のCTL（フィットネス）が最大になるテーパー期間・削減率を全探索"""
+    if days_to_race < 7:
+        return None
+    best, best_key = None, None
+    for td in range(5, min(21, days_to_race - 1) + 1):
+        for cut in range(20, 80, 5):
+            res = project_pmc_to_race(ctl0, atl0, days_to_race, weekly_tss, weekly_increase_pct, td, cut)
+            tsb = res["race_tsb"]
+            if tsb_lo <= tsb <= tsb_hi:
+                # CTL差 ±1 以内は同等とみなし、エビデンス上最適な約10日間のテーパーに近いものを優先
+                key = (0, -round(res["race_ctl"]), abs(td - 10), cut)
+            else:
+                key = (1, min(abs(tsb - tsb_lo), abs(tsb - tsb_hi)), abs(td - 10), cut)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = {"taper_days": td, "taper_cut_pct": cut, "in_band": key[0] == 0, **res}
+    return best
+
+
+def build_projection_chart(rows: list, tsb_lo: float, tsb_hi: float):
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df["tsb_color"] = df["tsb"].apply(lambda v: "#16a34a" if tsb_lo <= v <= tsb_hi else ("#d97706" if v >= -20 else "#dc2626"))
+    base = alt.Chart(df).encode(x=alt.X("date:T", title="日付", axis=alt.Axis(format="%m/%d")))
+    tooltip = [
+        alt.Tooltip("date:T", title="日付", format="%Y-%m-%d"),
+        alt.Tooltip("phase:N", title="フェーズ"),
+        alt.Tooltip("tss:Q", title="予定TSS/日"),
+        alt.Tooltip("ctl:Q", title="CTL"),
+        alt.Tooltip("atl:Q", title="ATL"),
+        alt.Tooltip("tsb:Q", title="TSB"),
+    ]
+    band_df = pd.DataFrame([{"lo": tsb_lo, "hi": tsb_hi}])
+    band = alt.Chart(band_df).mark_rect(color="#16a34a", opacity=0.10).encode(y="lo:Q", y2="hi:Q")
+    tsb_bars = base.mark_bar(opacity=0.5).encode(y=alt.Y("tsb:Q", title="CTL / ATL / TSB"), color=alt.Color("tsb_color:N", scale=None), tooltip=tooltip)
+    ctl_line = base.mark_line(color="#0284c7", strokeWidth=3).encode(y="ctl:Q", tooltip=tooltip)
+    atl_line = base.mark_line(color="#e11d48", strokeWidth=2.2, strokeDash=[4, 3]).encode(y="atl:Q", tooltip=tooltip)
+    race_rule = alt.Chart(df.tail(1)).mark_rule(color="#0f172a", strokeWidth=2.5, strokeDash=[2, 2]).encode(x="date:T", tooltip=tooltip)
+    return _apply_high_contrast_chart_theme(band + tsb_bars + ctl_line + atl_line + race_rule, 300)
+
+
 def build_system_prompt(profile: dict, metrics: dict) -> str:
     days_left = (profile["race_date"] - datetime.now().date()).days
     phase = determine_training_phase(days_left)
@@ -1600,11 +1874,25 @@ def build_system_prompt(profile: dict, metrics: dict) -> str:
         external_factor_prompt = "【外的要因・怪我・病気の制限】\n- 特になし（通常通りトレーニング可能）"
 
     memory_context = build_memory_context_str()
+    persona_prompt = build_coach_persona_prompt(profile.get("coach_strictness", 3))
+    compliance = compute_plan_compliance(
+        st.session_state.get("weekly_plan"),
+        (metrics or {}).get("activities", []) if metrics else [],
+    )
+    compliance_str = build_compliance_prompt_str(compliance)
 
     return f"""あなたはワールドツアーチーム帯同レベルのスポーツ科学知見（運動生理学・CP/W'モデル・HRV自律神経解析・スポーツ栄養学・バイオメカニクス）と実戦経験を持つ専属AIサイクリングコーチです。
 以下のアスリートデータ、HRVと睡眠スコアに基づくレディネス診断、外的要因（怪我・病気等）、および過去のコーチング記憶を踏まえ、一貫性のある具体的かつ論理的なアドバイスや練習メニューを提供してください。
 
+{persona_prompt}
+
 {external_factor_prompt}
+
+【📋 週間プランの計画遵守状況（予定 vs Intervals.icu 実績）】
+{compliance_str}
+
+【📈 ピーキング・テーパー計画（PMC将来予測）】
+{st.session_state.get("peaking_summary") or "（未作成）"}
 
 【🫀 本日のHRV・睡眠スコア・自律神経レディネス診断】
 {wellness_summary}
@@ -1772,7 +2060,7 @@ def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str
     last_err = None
 
     for current_m in candidates:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 if is_sarashina_model(current_m):
                     text_out = call_sarashina_chat(sarashina_key, current_m, contents, sys_prompt)
@@ -1808,8 +2096,9 @@ def stream_gemini_response(client_ai, model_name: str, contents, sys_prompt: str
                 if is_quota or is_not_found:
                     break
                 is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "502", "504"])
-                if is_busy and attempt < 1:
-                    time.sleep(2)
+                if is_busy and attempt < 2:
+                    # 指数バックオフ + ジッター (約2秒 → 約4秒) でサーバー混雑(503)の回復を待つ
+                    time.sleep((2 ** (attempt + 1)) + random.uniform(0, 1))
                     continue
                 else:
                     break
@@ -1850,7 +2139,7 @@ def generate_content_with_retry(client_ai, model_name: str, contents, config, sa
 """
 
     for current_m in candidates:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 if is_sarashina_model(current_m):
                     prompt_with_json = str(contents) + json_schema_instruction
@@ -1883,8 +2172,9 @@ def generate_content_with_retry(client_ai, model_name: str, contents, config, sa
                 if is_quota or is_not_found:
                     break
                 is_busy = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "502", "504"])
-                if is_busy and attempt < 1:
-                    time.sleep(2)
+                if is_busy and attempt < 2:
+                    # 指数バックオフ + ジッター (約2秒 → 約4秒) でサーバー混雑(503)の回復を待つ
+                    time.sleep((2 ** (attempt + 1)) + random.uniform(0, 1))
                     continue
                 else:
                     break
@@ -2359,6 +2649,18 @@ with st.sidebar:
         st.warning("⚠️ Gemini モデルが選択されています。Gemini API Key を入力して保存してください。")
 
     st.divider()
+    st.subheader("🎚️ AIコーチの厳しさ")
+    cur_strict = get_strictness_level(cfg.get("coach_strictness", 3))
+    coach_strictness = st.select_slider(
+        "コーチングの厳しさレベル",
+        options=[1, 2, 3, 4, 5],
+        value=cur_strict,
+        format_func=lambda v: COACH_STRICTNESS_LEVELS[v]["label"],
+        help="口調・要求水準・計画未達への追及度が変わります。HRV低下・怪我・病気などの安全制約は、どのレベルでも常に最優先されます。",
+    )
+    st.caption(f"💡 {COACH_STRICTNESS_LEVELS[coach_strictness]['desc']}")
+
+    st.divider()
     st.subheader("🏥 外的要因・怪我・病気の設定")
     st.caption("事故や体調不良、部位の痛みなどを最優先で考慮してメニューを安全に調整します。")
     ext_status_options = [
@@ -2433,6 +2735,7 @@ with st.sidebar:
         "ext_status": ext_status,
         "ext_detail": ext_detail,
         "ext_intensity_cap": ext_intensity_cap,
+        "coach_strictness": coach_strictness,
         "public_default_guest": pub_default,
     }
 
@@ -2608,6 +2911,7 @@ profile_data = {
     "ext_status": ext_status,
     "ext_detail": ext_detail,
     "ext_intensity_cap": ext_intensity_cap,
+    "coach_strictness": coach_strictness,
 }
 
 
@@ -2684,6 +2988,7 @@ with hdr_col1:
                 <span class="status-pill">{phase_str}</span>
                 <span class="status-pill">{phenotype_badge}</span>
                 <span class="status-pill">🤖 {selected_model}</span>
+                <span class="status-pill">🎚️ {COACH_STRICTNESS_LEVELS[coach_strictness]['label']}</span>
             </div>
         </div>
     </div>
@@ -2826,12 +3131,13 @@ if st.session_state.metrics and "pdc" in st.session_state.metrics:
         ])
         st.dataframe(zones_df, hide_index=True, use_container_width=True)
 
-# --- 6タブ構成 ---
-tab_daily, tab_weekly, tab_debrief, tab_simulator, tab_chat, tab_history = st.tabs([
+# --- 7タブ構成 ---
+tab_daily, tab_weekly, tab_debrief, tab_simulator, tab_peaking, tab_chat, tab_history = st.tabs([
     "🎯 今日のメニュー設計",
     "📅 週間プラン一括生成",
     "🔬 ライド科学診断・振り返り",
     "🏔️ レース＆ヒルクライム物理計算",
+    "📈 ピーキング・テーパー計画",
     "💬 AIコーチ相談",
     "📊 ライド履歴 & EFトレンド"
 ])
@@ -3096,6 +3402,25 @@ with tab_weekly:
         total_wk_min = sum(d.get("duration_min", 0) for d in plan.get("days", []))
         st.success(f"✨ 週間プラン表示中 — 週間合計予定時間: **{round(total_wk_min/60, 1)}時間 ({total_wk_min}分)** ／ 週間合計目標TSS: **{total_wk_tss} TSS**")
         st.markdown(f"**【今週のコーチング方針】**\n\n{plan['weekly_summary']}")
+
+        # --- 計画遵守率（予定 vs Intervals.icu 実績） ---
+        comp = compute_plan_compliance(plan, (st.session_state.metrics or {}).get("activities", []))
+        if comp and comp.get("rows"):
+            with st.expander(
+                f"📋 計画遵守トラッカー（予定 vs 実績） — 遵守率: "
+                f"{str(comp['pct']) + '%' if comp.get('pct') is not None else '評価待ち'}",
+                expanded=comp.get("pct") is not None,
+            ):
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("🎯 計画遵守率", f"{comp['pct']}%" if comp.get("pct") is not None else "--", f"評価済み {comp['evaluated_days']}日")
+                cc2.metric("📌 予定TSS（経過日）", comp["planned_tss_to_date"])
+                diff_tss = comp["actual_tss_to_date"] - comp["planned_tss_to_date"]
+                cc3.metric("🚴 実績TSS（経過日）", comp["actual_tss_to_date"], f"{diff_tss:+} TSS")
+                st.dataframe(pd.DataFrame(comp["rows"]), hide_index=True, use_container_width=True)
+                st.caption(
+                    "判定基準: 予定TSSの85〜115%=✅達成 / 50〜85%=🟡一部達成 / 50%未満=🔴大幅未達 / 115%超=⚠️やり過ぎ / 休養日はTSS30以下で✅。"
+                    "実績は「🔄 最新データ同期」時点の Intervals.icu データです。この遵守状況はAIコーチにも共有され、厳しさレベルに応じたフィードバックに反映されます。"
+                )
 
         for idx, day_item in enumerate(plan["days"]):
             badge = "🛌 休養日" if day_item["is_rest_day"] else f"🚴‍♂️ {day_item['duration_min']}分 / 目標TSS: {day_item['target_tss']}"
@@ -3450,17 +3775,125 @@ with tab_simulator:
 
 
 # ==========================================
+# Tab 4-B: ピーキング・テーパー計画（Banister PMC 将来予測 & 自動最適化）
+# ==========================================
+with tab_peaking:
+    st.subheader("📈 レース当日にピークを合わせる — PMC将来予測 ＆ テーパー自動最適化")
+    st.caption(
+        "Banister型インパルス応答モデル（CTL τ=42日 / ATL τ=7日：Intervals.icu と同じ定数）で、"
+        "レース当日朝のフィットネス(CTL)・疲労(ATL)・フォーム(TSB)を予測します。"
+    )
+
+    pk_days = (race_date - datetime.now().date()).days
+    if pk_days <= 0:
+        st.info("サイドバーの『開催日』に未来のレース日を設定すると、ピーキング計画を作成できます。")
+    else:
+        mt = st.session_state.metrics or {}
+        cur_ctl = float(mt.get("ctl") or 0.0)
+        cur_atl = float(mt.get("atl") or 0.0)
+        recent_acts = mt.get("activities", []) or []
+        cutoff = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
+        tss_28 = sum(int(a.get("TSS") or 0) for a in recent_acts if str(a.get("日付", "")) >= cutoff)
+        default_week_tss = int(round(tss_28 / 4)) if tss_28 > 0 else int(round(max(cur_ctl, 40) * 7))
+
+        pk1, pk2, pk3, pk4 = st.columns(4)
+        with pk1:
+            in_ctl = st.number_input("現在の CTL", 0.0, 200.0, min(200.0, round(cur_ctl, 1)), 0.5, key="pk_ctl")
+            in_atl = st.number_input("現在の ATL", 0.0, 250.0, min(250.0, round(cur_atl, 1)), 0.5, key="pk_atl")
+        with pk2:
+            in_week_tss = st.number_input(
+                "ビルド期の週間TSS", 50, 1500, max(50, min(1500, default_week_tss)), 10, key="pk_wtss",
+                help=f"初期値は直近28日の実績平均（{default_week_tss} TSS/週）です。",
+            )
+            in_inc = st.slider("週ごとの負荷漸増率 (%)", 0, 12, 3, 1, key="pk_inc",
+                               help="漸進的過負荷。一般に週3〜8%程度が過トレーニングを避けつつCTLを伸ばせる範囲です。")
+        with pk3:
+            tsb_band = st.slider("レース当日の目標TSB帯", -10, 35, (5, 20), 1, key="pk_band",
+                                 help="一般的にA優先レースは TSB +5〜+20 が目安。短時間高強度(ヒルクライム/TT)はやや高め、長距離ロードはやや低めでも可。")
+        with pk4:
+            pk_mode = st.radio("テーパー設定", ["🤖 自動最適化", "✋ 手動設定"], key="pk_mode")
+            man_td = st.slider("テーパー日数", 3, 21, 10, 1, key="pk_td", disabled=(pk_mode == "🤖 自動最適化"))
+            man_cut = st.slider("テーパー中の負荷削減率 (%)", 10, 80, 45, 5, key="pk_cut", disabled=(pk_mode == "🤖 自動最適化"))
+
+        if pk_mode == "🤖 自動最適化":
+            res_pk = optimize_taper(in_ctl, in_atl, pk_days, in_week_tss, in_inc, tsb_band[0], tsb_band[1])
+            if res_pk is None:
+                res_pk = project_pmc_to_race(in_ctl, in_atl, pk_days, in_week_tss, in_inc, max(1, pk_days - 1), 50)
+                res_pk.update({"taper_days": max(1, pk_days - 1), "taper_cut_pct": 50, "in_band": tsb_band[0] <= res_pk["race_tsb"] <= tsb_band[1]})
+        else:
+            td_eff = min(man_td, max(1, pk_days - 1))
+            res_pk = project_pmc_to_race(in_ctl, in_atl, pk_days, in_week_tss, in_inc, td_eff, man_cut)
+            res_pk.update({"taper_days": td_eff, "taper_cut_pct": man_cut, "in_band": tsb_band[0] <= res_pk["race_tsb"] <= tsb_band[1]})
+
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("🏁 レース当日 CTL", res_pk["race_ctl"], f"{res_pk['race_ctl'] - in_ctl:+.1f} (現在比)")
+        r2.metric("⚖️ レース当日 TSB", f"{res_pk['race_tsb']:+}", "目標帯内 ✅" if res_pk["in_band"] else "目標帯外 ⚠️")
+        r3.metric("📉 ピークCTLからの低下", f"{res_pk['ctl_drop_pct']}%", f"ピーク {res_pk['peak_ctl']}")
+        r4.metric("🗓️ 推奨テーパー", f"{res_pk['taper_days']}日間", f"負荷 -{res_pk['taper_cut_pct']}%")
+        ramp_flag = "⚠️ 急上昇" if res_pk["max_weekly_ramp"] > 8 else ("適正" if res_pk["max_weekly_ramp"] >= 2 else "維持")
+        r5.metric("📈 最大Ramp Rate", f"{res_pk['max_weekly_ramp']:+} /週", ramp_flag)
+
+        pk_chart = build_projection_chart(res_pk["rows"], tsb_band[0], tsb_band[1])
+        if pk_chart:
+            st.altair_chart(pk_chart, use_container_width=True, theme=None)
+            st.caption("水色実線: CTL（フィットネス） / 赤破線: ATL（疲労） / 棒: TSB（緑=目標帯内） / 薄緑帯: 目標TSB帯 / 黒点線: レース当日")
+
+        taper_start = race_date - timedelta(days=res_pk["taper_days"])
+        taper_daily = round(res_pk["pre_taper_week_tss"] / 7 * (1 - res_pk["taper_cut_pct"] / 100))
+        notes = [
+            f"**ビルド期（〜{(taper_start - timedelta(days=1)).strftime('%m/%d')}）**: 週間TSS {in_week_tss} から毎週 +{in_inc}% で漸増（テーパー直前の週 ≒ {res_pk['pre_taper_week_tss']} TSS）。",
+            f"**テーパー期（{taper_start.strftime('%m/%d')}〜レース前日）**: 1日あたり平均 約{taper_daily} TSS（-{res_pk['taper_cut_pct']}%）。"
+            "**削るのは『量（時間）』であり『強度』と『頻度』は維持**すること（Bosquet et al., 2007 のメタ分析: 2週間前後・量41〜60%削減・強度維持が最も効果的）。",
+            "**テーパー中の刺激例**: レース強度（95〜105%FTP）の短いインターバル 3〜4×3分、レース2日前に 3×30秒の開脚スプリントで神経系を活性化。",
+        ]
+        if not res_pk["in_band"]:
+            if res_pk["race_tsb"] < tsb_band[0]:
+                notes.append("⚠️ **疲労が抜け切らない予測です。** 週間TSSを下げるか、レースまでの日数に対して負荷漸増率を抑えてください。")
+            else:
+                notes.append("⚠️ **フレッシュ過ぎ（フィットネス低下）の予測です。** ビルド期の週間TSSを増やすか、テーパーを短くしてください。")
+        if res_pk["max_weekly_ramp"] > 8:
+            notes.append("🚨 **Ramp Rate が週+8を超えます。** オーバーリーチング・怪我・免疫低下のリスクが高いため、漸増率を下げてください。")
+        if res_pk["ctl_drop_pct"] > 10:
+            notes.append("⚠️ **ピークからCTLが10%以上低下します。** テーパーが長すぎる/削り過ぎの可能性があります。")
+        st.markdown("\n".join(f"- {n}" for n in notes))
+
+        # AIコーチへ共有（日次メニュー・週間プラン・チャットのプロンプトに自動反映）
+        st.session_state.peaking_summary = (
+            f"- レースまで {pk_days}日 / 推奨テーパー開始日: {taper_start} （{res_pk['taper_days']}日間・負荷-{res_pk['taper_cut_pct']}%）\n"
+            f"- ビルド期 週間TSS目安: {in_week_tss}→{res_pk['pre_taper_week_tss']} (漸増 +{in_inc}%/週)\n"
+            f"- 予測: レース当日 CTL {res_pk['race_ctl']} / TSB {res_pk['race_tsb']:+} (目標帯 {tsb_band[0]:+}〜{tsb_band[1]:+})"
+        )
+        st.caption("✅ このピーキング計画は AIコーチに自動共有され、今日のメニュー・週間プラン・チャット回答の負荷設計に反映されます。")
+
+
+# ==========================================
 # Tab 5: AIコーチ・チャット相談（永続記憶付き・入力欄最下部固定）
 # ==========================================
 with tab_chat:
     col_ch1, col_ch2 = st.columns([4, 1])
     with col_ch1:
-        st.caption("💬 過去の会話履歴・ライド評価・HRV/睡眠状態・CP/W'・怪我や病気の設定をすべて記憶した状態で相談できます。（入力欄は常に画面最下部に固定されています）")
+        st.caption(
+            f"💬 過去の会話履歴・ライド評価・HRV/睡眠状態・CP/W'・計画遵守率・怪我や病気の設定をすべて記憶した状態で相談できます。"
+            f" 現在のコーチ: **{COACH_STRICTNESS_LEVELS[coach_strictness]['label']}**（サイドバーの『🎚️ AIコーチの厳しさ』で変更）"
+        )
     with col_ch2:
         if st.button("🗑️ 会話履歴をクリア", use_container_width=True):
             st.session_state.messages = []
             save_memory()
             st.rerun()
+
+    quick_prompts = {
+        "🚦 今日は走るべき？": "今日のHRV・睡眠・TSBを踏まえて、今日は走るべきか休むべきか、走るなら強度と時間を具体的に指示してください。",
+        "📋 今週の評価": "今週の計画遵守状況と実績ライドを評価し、良かった点・課題・来週の修正点を教えてください。",
+        "🎯 目標までのギャップ": "目標FTP・目標レースに対する現在のギャップを数値で示し、レースまでに最優先で伸ばすべき能力とその練習を教えてください。",
+        "🍙 補給・リカバリー": "直近の練習負荷に合わせて、練習前・中・後の補給量（糖質・タンパク質・水分）と睡眠・リカバリーの具体策を教えてください。",
+    }
+    quick_selected = None
+    qp_cols = st.columns(len(quick_prompts))
+    for qc, (q_label, q_text) in zip(qp_cols, quick_prompts.items()):
+        with qc:
+            if st.button(q_label, use_container_width=True, key=f"qp_{q_label}"):
+                quick_selected = q_text
 
     # メッセージ表示用コンテナを st.chat_input の上に配置することで、新規発言時も常に入力欄が最下部に位置する
     chat_container = st.container()
@@ -3469,7 +3902,8 @@ with tab_chat:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-    if prompt := st.chat_input("例: 今日のHRVと睡眠スコア的に走っても大丈夫？ / 富士ヒルで65分を切るためにあと何を伸ばすべき？"):
+    typed_prompt = st.chat_input("例: 今日のHRVと睡眠スコア的に走っても大丈夫？ / 富士ヒルで65分を切るためにあと何を伸ばすべき？")
+    if prompt := (typed_prompt or quick_selected):
         if is_sarashina_model(selected_model) and not sarashina_key and not gemini_key:
             st.error("サイドバーで Sarashina AI API Key を設定・保存してください。")
         elif not gemini_key and not sarashina_key:
