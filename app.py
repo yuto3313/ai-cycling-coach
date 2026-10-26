@@ -16,11 +16,37 @@ from google.genai import types
 import altair as alt
 import time
 import random
+import zlib
+import base64
 
 CONFIG_FILE = "config.json"
 CACHE_FILE = "intervals_cache.json"
 MEMORY_FILE = "coach_memory.json"
 USER_DATA_DIR = "user_data"
+CLOUD_SYNC_DATE = "2099-12-31"
+CLOUD_CFG_EVENT_NAME = "__AI_COACH_PRO_SETTINGS__"
+CLOUD_MEM_EVENT_NAME = "__AI_COACH_PRO_MEMORY__"
+
+PERSISTED_PROFILE_KEYS = [
+    "athlete_id",
+    "athlete_name",
+    "model",
+    "ftp",
+    "weight",
+    "target_ftp",
+    "race_name",
+    "race_date",
+    "race_type",
+    "race_goal",
+    "weekday_hours",
+    "weekend_hours",
+    "ext_status",
+    "ext_detail",
+    "ext_intensity_cap",
+    "coach_strictness",
+    "public_default_guest",
+    "updated_at",
+]
 
 # ==========================================
 # 0. 設定・キャッシュ・AI記憶の自動保存マネージャー（マルチユーザー＆厳格セキュリティ対応）
@@ -49,6 +75,7 @@ DEFAULT_CONFIG = {
     "coach_strictness": 3,
     # 公開設定
     "public_default_guest": False,
+    "updated_at": 0.0,
 }
 
 DEFAULT_MEMORY = {
@@ -58,7 +85,35 @@ DEFAULT_MEMORY = {
     "weekly_plan": None,          # 最新の週間プラン dict
     "weekly_plan_history": [],    # 過去の週間プラン履歴
     "ride_reviews": {},           # アクティビティID別の評価履歴
+    "updated_at": 0.0,
 }
+
+
+def encode_cfg_param(config: dict) -> str:
+    """非機密のプロファイル設定をURLクエリパラメータ用に圧縮・Base64URLエンコード"""
+    try:
+        slim = {k: config.get(k) for k in PERSISTED_PROFILE_KEYS if k in config and config.get(k) is not None}
+        raw_bytes = json.dumps(slim, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        compressed = zlib.compress(raw_bytes, level=9)
+        return base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+    except Exception:
+        return ""
+
+
+def decode_cfg_param(encoded: str) -> dict:
+    """URLクエリパラメータの圧縮設定文字列を辞書にデコード"""
+    if not encoded or not isinstance(encoded, str):
+        return {}
+    try:
+        pad = "=" * ((4 - len(encoded) % 4) % 4)
+        compressed = base64.urlsafe_b64decode((encoded + pad).encode("ascii"))
+        raw_bytes = zlib.decompress(compressed)
+        data = json.loads(raw_bytes.decode("utf-8"))
+        if isinstance(data, dict):
+            return {k: data[k] for k in PERSISTED_PROFILE_KEYS if k in data}
+    except Exception:
+        pass
+    return {}
 
 
 def compute_user_uid(intervals_key: str, athlete_id: str = "") -> str:
@@ -103,8 +158,17 @@ def _normalize_model_name(config: dict) -> dict:
 
 
 def load_owner_config() -> dict:
-    """オーナー（自分）専用の設定を config.json および st.secrets から読み込む"""
+    """オーナー（自分）専用の設定を config.json、st.secrets、URLクエリパラメータから読み込む"""
     config = DEFAULT_CONFIG.copy()
+    # 1. st.secrets に設定値があればフォールバック初期値として読み込む
+    try:
+        for k in DEFAULT_CONFIG:
+            if k in st.secrets and st.secrets[k] is not None and str(st.secrets[k]).strip() != "":
+                config[k] = st.secrets[k]
+    except Exception:
+        pass
+
+    # 2. ローカル config.json を読み込む
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -112,12 +176,28 @@ def load_owner_config() -> dict:
                 config.update(saved)
         except Exception:
             pass
+
+    # 3. APIキーが config.json で空の場合は st.secrets から補完
     try:
         for k in ["athlete_id", "intervals_key", "gemini_key", "sarashina_key"]:
             if not config.get(k) and k in st.secrets:
                 config[k] = st.secrets[k]
     except Exception:
         pass
+
+    # 4. セッションメモリ内またはURLパラメータ (?cfg=...) に新しい設定があれば復元
+    if "active_owner_config" in st.session_state and isinstance(st.session_state.active_owner_config, dict):
+        mem_cfg = st.session_state.active_owner_config
+        if float(mem_cfg.get("updated_at") or 0) >= float(config.get("updated_at") or 0):
+            config.update(mem_cfg)
+
+    try:
+        q_cfg = decode_cfg_param(st.query_params.get("cfg", ""))
+        if q_cfg and float(q_cfg.get("updated_at") or 0) > float(config.get("updated_at") or 0):
+            config.update(q_cfg)
+    except Exception:
+        pass
+
     return _normalize_model_name(config)
 
 
@@ -129,26 +209,38 @@ def load_config() -> dict:
 
     # ゲスト（他の人）モードの場合：オーナーのキーや設定は一切読み込まない
     config = DEFAULT_CONFIG.copy()
-    if "guest_config" in st.session_state and isinstance(st.session_state.guest_config, dict):
-        config.update(st.session_state.guest_config)
-
     cfg_path, _, _ = get_active_file_paths()
     if cfg_path and os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                for k, v in saved.items():
-                    if not config.get(k) or k not in st.session_state.get("guest_config", {}):
-                        config[k] = v
+                config.update(saved)
         except Exception:
             pass
+
+    if "guest_config" in st.session_state and isinstance(st.session_state.guest_config, dict):
+        if float(st.session_state.guest_config.get("updated_at") or 0) >= float(config.get("updated_at") or 0):
+            config.update(st.session_state.guest_config)
+
+    try:
+        q_cfg = decode_cfg_param(st.query_params.get("cfg", ""))
+        if q_cfg and float(q_cfg.get("updated_at") or 0) > float(config.get("updated_at") or 0):
+            config.update(q_cfg)
+    except Exception:
+        pass
+
     return _normalize_model_name(config)
 
 
-def save_config(new_config: dict):
-    """現在のログインユーザーの設定を保存する（ゲストの場合はオーナーのconfig.jsonを上書きしない）"""
+def save_config(new_config: dict, sync_cloud: bool = True):
+    """現在のログインユーザーの設定をローカル・URLパラメータ・Intervals.icuクラウドの3層へ永続保存する"""
+    new_config = new_config.copy()
+    new_config["updated_at"] = round(time.time(), 2)
+
     mode = st.session_state.get("user_mode", "owner")
-    if mode != "owner":
+    if mode == "owner":
+        st.session_state.active_owner_config = new_config.copy()
+    else:
         st.session_state.guest_config = new_config.copy()
         uid = compute_user_uid(new_config.get("intervals_key", ""), new_config.get("athlete_id", ""))
         if uid:
@@ -159,14 +251,34 @@ def save_config(new_config: dict):
             except Exception:
                 pass
 
-    cfg_path, _, _ = get_active_file_paths()
-    if not cfg_path:
-        return
+    # URLクエリパラメータ (?cfg=...) にも圧縮スナップショットを保持（アイドル再接続時の即時復元用）
     try:
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(new_config, f, ensure_ascii=False, indent=2)
+        encoded = encode_cfg_param(new_config)
+        if encoded:
+            st.query_params["cfg"] = encoded
     except Exception:
         pass
+
+    cfg_path, _, _ = get_active_file_paths()
+    if cfg_path:
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(new_config, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # Intervals.icu クラウドバックアップへ同期（コンテナ再起動・別端末アクセス時にも完全復元）
+    if sync_cloud and new_config.get("intervals_key"):
+        try:
+            client = IntervalsClient(new_config.get("athlete_id", ""), new_config.get("intervals_key", ""))
+            ev_id = client.push_cloud_config(
+                new_config,
+                event_id=st.session_state.get("_cloud_cfg_event_id"),
+            )
+            if ev_id:
+                st.session_state["_cloud_cfg_event_id"] = ev_id
+        except Exception:
+            pass
 
 
 def load_memory() -> dict:
@@ -177,6 +289,7 @@ def load_memory() -> dict:
         "weekly_plan": None,
         "weekly_plan_history": [],
         "ride_reviews": {},
+        "updated_at": 0.0,
     }
     _, _, mem_path = get_active_file_paths()
     if mem_path and os.path.exists(mem_path):
@@ -191,24 +304,40 @@ def load_memory() -> dict:
     return mem
 
 
-def save_memory():
-    """現在のst.session_state内の記憶データを現在のユーザー専用ファイルへ永続化"""
+def save_memory(sync_cloud: bool = True):
+    """現在のst.session_state内の記憶データをローカルおよびIntervals.icuクラウドへ永続化"""
     _, _, mem_path = get_active_file_paths()
-    if not mem_path:
-        return
-    try:
-        mem_data = {
-            "messages": st.session_state.get("messages", [])[-60:],
-            "generated_workout": st.session_state.get("generated_workout"),
-            "daily_workout_history": st.session_state.get("daily_workout_history", [])[-20:],
-            "weekly_plan": st.session_state.get("weekly_plan"),
-            "weekly_plan_history": st.session_state.get("weekly_plan_history", [])[-10:],
-            "ride_reviews": st.session_state.get("ride_reviews", {}),
-        }
-        with open(mem_path, "w", encoding="utf-8") as f:
-            json.dump(mem_data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    mem_data = {
+        "messages": st.session_state.get("messages", [])[-60:],
+        "generated_workout": st.session_state.get("generated_workout"),
+        "daily_workout_history": st.session_state.get("daily_workout_history", [])[-20:],
+        "weekly_plan": st.session_state.get("weekly_plan"),
+        "weekly_plan_history": st.session_state.get("weekly_plan_history", [])[-10:],
+        "ride_reviews": st.session_state.get("ride_reviews", {}),
+        "updated_at": round(time.time(), 2),
+    }
+    if mem_path:
+        try:
+            with open(mem_path, "w", encoding="utf-8") as f:
+                json.dump(mem_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    if sync_cloud:
+        try:
+            cur_cfg = load_config()
+            ikey = cur_cfg.get("intervals_key", "")
+            aid = cur_cfg.get("athlete_id", "")
+            if ikey:
+                client = IntervalsClient(aid, ikey)
+                ev_id = client.push_cloud_memory(
+                    mem_data,
+                    event_id=st.session_state.get("_cloud_mem_event_id"),
+                )
+                if ev_id:
+                    st.session_state["_cloud_mem_event_id"] = ev_id
+        except Exception:
+            pass
 
 
 def save_metrics_cache(metrics: dict):
@@ -355,6 +484,125 @@ class IntervalsClient:
         res = requests.post(url, auth=self.auth, json=payload, timeout=10)
         res.raise_for_status()
         return res.json()
+
+    def _ensure_athlete_id(self) -> str:
+        if not self.athlete_id or self.athlete_id == "0":
+            try:
+                prof = self.get_athlete_profile()
+                if prof.get("athlete_id"):
+                    self.athlete_id = prof["athlete_id"]
+            except Exception:
+                pass
+        return self.athlete_id
+
+    def fetch_cloud_state(self) -> dict:
+        """Intervals.icu 上の専用設定ノート (2099-12-31) から設定とAI記憶を取得"""
+        self._ensure_athlete_id()
+        url = f"{self.BASE_URL}/athlete/{self.athlete_id}/events"
+        res = requests.get(
+            url,
+            auth=self.auth,
+            params={"oldest": CLOUD_SYNC_DATE, "newest": CLOUD_SYNC_DATE},
+            timeout=10,
+        )
+        res.raise_for_status()
+        events = res.json() or []
+
+        cfg_ev_id, cfg_data = None, None
+        mem_ev_id, mem_data = None, None
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            ev_name = ev.get("name", "")
+            desc = ev.get("description", "")
+            if ev_name == CLOUD_CFG_EVENT_NAME and desc:
+                try:
+                    parsed = json.loads(desc)
+                    if isinstance(parsed, dict):
+                        if cfg_data is None or float(parsed.get("updated_at") or 0) >= float(cfg_data.get("updated_at") or 0):
+                            cfg_ev_id = ev.get("id")
+                            cfg_data = parsed
+                except Exception:
+                    pass
+            elif ev_name == CLOUD_MEM_EVENT_NAME and desc:
+                try:
+                    parsed = json.loads(desc)
+                    if isinstance(parsed, dict):
+                        if mem_data is None or float(parsed.get("updated_at") or 0) >= float(mem_data.get("updated_at") or 0):
+                            mem_ev_id = ev.get("id")
+                            mem_data = parsed
+                except Exception:
+                    pass
+
+        return {
+            "cfg_event_id": cfg_ev_id,
+            "cfg": cfg_data,
+            "mem_event_id": mem_ev_id,
+            "mem": mem_data,
+        }
+
+    def _upsert_cloud_note(self, event_name: str, payload_dict: dict, event_id=None) -> int | None:
+        self._ensure_athlete_id()
+        base = f"{self.BASE_URL}/athlete/{self.athlete_id}/events"
+        desc_str = json.dumps(payload_dict, ensure_ascii=False)
+        body = {
+            "category": "NOTE",
+            "start_date_local": f"{CLOUD_SYNC_DATE}T00:00:00",
+            "name": event_name,
+            "description": desc_str,
+        }
+        if event_id:
+            res = requests.put(f"{base}/{event_id}", auth=self.auth, json=body, timeout=10)
+            if res.status_code == 200:
+                return event_id
+
+        # 既存イベントを検索して更新または新規作成（重複があれば削除）
+        try:
+            r_list = requests.get(
+                base,
+                auth=self.auth,
+                params={"oldest": CLOUD_SYNC_DATE, "newest": CLOUD_SYNC_DATE},
+                timeout=10,
+            )
+            if r_list.status_code == 200:
+                matches = [e for e in (r_list.json() or []) if isinstance(e, dict) and e.get("name") == event_name]
+                if matches:
+                    primary_id = matches[0].get("id")
+                    for dup in matches[1:]:
+                        try:
+                            requests.delete(f"{base}/{dup.get('id')}", auth=self.auth, timeout=5)
+                        except Exception:
+                            pass
+                    r_put = requests.put(f"{base}/{primary_id}", auth=self.auth, json=body, timeout=10)
+                    if r_put.status_code == 200:
+                        return primary_id
+        except Exception:
+            pass
+
+        r_post = requests.post(base, auth=self.auth, json=body, timeout=10)
+        r_post.raise_for_status()
+        return (r_post.json() or {}).get("id")
+
+    def push_cloud_config(self, cfg_data: dict, event_id=None) -> int | None:
+        """非機密のプロファイル設定のみを Intervals.icu クラウドノートへ保存"""
+        slim = {k: cfg_data.get(k) for k in PERSISTED_PROFILE_KEYS if k in cfg_data}
+        if not slim.get("updated_at"):
+            slim["updated_at"] = round(time.time(), 2)
+        return self._upsert_cloud_note(CLOUD_CFG_EVENT_NAME, slim, event_id=event_id)
+
+    def push_cloud_memory(self, mem_data: dict, event_id=None) -> int | None:
+        """AIコーチ記憶のコンパクト版を Intervals.icu クラウドノートへ保存"""
+        compact_mem = {
+            "messages": (mem_data.get("messages") or [])[-20:],
+            "generated_workout": mem_data.get("generated_workout"),
+            "daily_workout_history": (mem_data.get("daily_workout_history") or [])[-5:],
+            "weekly_plan": mem_data.get("weekly_plan"),
+            "weekly_plan_history": (mem_data.get("weekly_plan_history") or [])[-3:],
+            "ride_reviews": mem_data.get("ride_reviews") or {},
+            "updated_at": mem_data.get("updated_at") or round(time.time(), 2),
+        }
+        return self._upsert_cloud_note(CLOUD_MEM_EVENT_NAME, compact_mem, event_id=event_id)
+
 
     def get_activity_segments(self, activity_id: str) -> list:
         """Stravaセグメント一覧と各セグメントのタイム・パワー・心拍を算出"""
@@ -2512,6 +2760,72 @@ is_owner_mode = (st.session_state.user_mode == "owner")
 cfg = load_config()
 mem = load_memory()
 
+# サーバー再起動・スリープ復帰・別端末アクセス時に Intervals.icu クラウドバックアップから設定と記憶を自動復元
+_restore_flag_key = f"_cloud_restored_{st.session_state.get('user_mode', 'owner')}_{st.session_state.get('guest_uid', '')}"
+if not st.session_state.get(_restore_flag_key) and cfg.get("intervals_key"):
+    st.session_state[_restore_flag_key] = True
+    try:
+        _c_client = IntervalsClient(cfg.get("athlete_id", ""), cfg.get("intervals_key", ""))
+        _c_state = _c_client.fetch_cloud_state()
+        if _c_state.get("cfg_event_id"):
+            st.session_state["_cloud_cfg_event_id"] = _c_state["cfg_event_id"]
+        if _c_state.get("mem_event_id"):
+            st.session_state["_cloud_mem_event_id"] = _c_state["mem_event_id"]
+
+        _cloud_cfg = _c_state.get("cfg")
+        if isinstance(_cloud_cfg, dict) and _cloud_cfg:
+            _cloud_ts = float(_cloud_cfg.get("updated_at") or 0)
+            _local_ts = float(cfg.get("updated_at") or 0)
+            if _cloud_ts >= _local_ts:
+                for _k in PERSISTED_PROFILE_KEYS:
+                    if _k in _cloud_cfg and _cloud_cfg[_k] is not None and _cloud_cfg[_k] != "":
+                        cfg[_k] = _cloud_cfg[_k]
+                cfg = _normalize_model_name(cfg)
+                save_config(cfg, sync_cloud=False)
+            else:
+                _ev_id = _c_client.push_cloud_config(cfg, event_id=_c_state.get("cfg_event_id"))
+                if _ev_id:
+                    st.session_state["_cloud_cfg_event_id"] = _ev_id
+        else:
+            # クラウドバックアップが未作成の場合：もしローカル設定も初期値のままなら Intervals.icu の実FTP/体重を取得して初期バックアップ作成
+            _cfg_file_path, _, _ = get_active_file_paths()
+            if float(cfg.get("updated_at") or 0) == 0 and (not _cfg_file_path or not os.path.exists(_cfg_file_path)):
+                try:
+                    _prof = _c_client.get_athlete_profile()
+                    if _prof.get("athlete_id"):
+                        cfg["athlete_id"] = _prof["athlete_id"]
+                    if _prof.get("ftp"):
+                        cfg["ftp"] = int(_prof["ftp"])
+                    if _prof.get("weight"):
+                        cfg["weight"] = float(_prof["weight"])
+                except Exception:
+                    pass
+            save_config(cfg, sync_cloud=True)
+
+        _cloud_mem = _c_state.get("mem")
+        if isinstance(_cloud_mem, dict) and _cloud_mem:
+            _cloud_mts = float(_cloud_mem.get("updated_at") or 0)
+            _local_mts = float(mem.get("updated_at") or 0)
+            _local_empty = not (mem.get("messages") or mem.get("generated_workout") or mem.get("weekly_plan") or mem.get("ride_reviews"))
+            if _cloud_mts >= _local_mts or _local_empty:
+                for _mk in ["messages", "generated_workout", "daily_workout_history", "weekly_plan", "weekly_plan_history", "ride_reviews", "updated_at"]:
+                    if _mk in _cloud_mem and _cloud_mem[_mk] is not None:
+                        mem[_mk] = _cloud_mem[_mk]
+                st.session_state.messages = mem.get("messages", [])
+                st.session_state.generated_workout = mem.get("generated_workout")
+                st.session_state.daily_workout_history = mem.get("daily_workout_history", [])
+                st.session_state.weekly_plan = mem.get("weekly_plan")
+                st.session_state.weekly_plan_history = mem.get("weekly_plan_history", [])
+                st.session_state.ride_reviews = mem.get("ride_reviews", {})
+                save_memory(sync_cloud=False)
+        elif mem.get("messages") or mem.get("generated_workout") or mem.get("weekly_plan") or mem.get("ride_reviews"):
+            _mev_id = _c_client.push_cloud_memory(mem, event_id=_c_state.get("mem_event_id"))
+            if _mev_id:
+                st.session_state["_cloud_mem_event_id"] = _mev_id
+    except Exception:
+        pass
+
+
 if "metrics" not in st.session_state:
     st.session_state.metrics = load_metrics_cache()
 if "messages" not in st.session_state:
@@ -2737,11 +3051,20 @@ with st.sidebar:
         "ext_intensity_cap": ext_intensity_cap,
         "coach_strictness": coach_strictness,
         "public_default_guest": pub_default,
+        "updated_at": cfg.get("updated_at", 0.0),
     }
 
+    # サイドバーの項目が1つでも変更されたら即座に自動保存＆クラウド同期（未操作後の再起動による初期化を完全防止）
+    _watch_keys = [k for k in PERSISTED_PROFILE_KEYS if k != "updated_at"] + ["intervals_key", "gemini_key", "sarashina_key"]
+    if any(current_cfg_dict.get(k) != cfg.get(k) for k in _watch_keys):
+        save_config(current_cfg_dict, sync_cloud=True)
+        cfg = load_config()
+        st.toast("💾 設定変更を自動保存しました（クラウド同期済）")
+
     if st.button("💾 設定を保存する", use_container_width=True):
-        save_config(current_cfg_dict)
-        st.success("✅ 設定を保存しました！")
+        save_config(current_cfg_dict, sync_cloud=True)
+        cfg = load_config()
+        st.success("✅ 設定を保存しました！（Intervals.icu クラウドにもバックアップ済のため、再起動しても初期化されません）")
 
     st.divider()
     with st.expander("🧠 記憶データのバックアップ / 管理"):
@@ -2931,9 +3254,9 @@ def sync_intervals_now(show_msg=True):
                         athlete_id = prof["athlete_id"]
                         current_cfg_dict["athlete_id"] = athlete_id
                         client = IntervalsClient(athlete_id, intervals_key)
+                        save_config(current_cfg_dict, sync_cloud=True)
                 except Exception:
                     pass
-            save_config(current_cfg_dict)
             wellness = client.get_wellness(days=40)
             activities = client.get_activities(days=40)
             pdc_raw = client.get_power_curves(curves="1y")
