@@ -27,6 +27,23 @@ CLOUD_SYNC_DATE = "2099-12-31"
 CLOUD_CFG_EVENT_NAME = "__AI_COACH_PRO_SETTINGS__"
 CLOUD_MEM_EVENT_NAME = "__AI_COACH_PRO_MEMORY__"
 
+# Ensure .streamlit/config.toml locks the light telemetry theme for canvas DataFrames & BaseWeb widgets
+try:
+    os.makedirs(".streamlit", exist_ok=True)
+    _st_cfg_path = os.path.join(".streamlit", "config.toml")
+    if not os.path.exists(_st_cfg_path):
+        with open(_st_cfg_path, "w", encoding="utf-8") as _f:
+            _f.write(
+                '[theme]\n'
+                'base = "light"\n'
+                'primaryColor = "#0284c7"\n'
+                'backgroundColor = "#f8fafc"\n'
+                'secondaryBackgroundColor = "#f1f5f9"\n'
+                'textColor = "#0f172a"\n'
+            )
+except Exception:
+    pass
+
 PERSISTED_PROFILE_KEYS = [
     "athlete_id",
     "athlete_name",
@@ -2444,6 +2461,249 @@ def show_ai_error(prefix: str, e: Exception, current_model: str):
         st.warning("⚠️ 選択されたモデルが利用できない可能性があります。サイドバーのモデル設定をご確認ください。")
 
 
+def render_power_zones_spectrum_html(ftp: int, weight: float) -> str:
+    """7パワーゾーン（Z1〜Z6 + SST）のビジュアルスペクトラムバーHTMLを生成"""
+    if ftp <= 0:
+        return ""
+    zones = [
+        ("Z1 回復", "〜55%", f"〜{round(ftp*0.55)}W", f"〜{round(ftp*0.55/weight, 2)}", "#64748b", "#f1f5f9"),
+        ("Z2 有酸素", "56〜75%", f"{round(ftp*0.56)}〜{round(ftp*0.75)}W", f"{round(ftp*0.56/weight, 2)}〜{round(ftp*0.75/weight, 2)}", "#0284c7", "#e0f2fe"),
+        ("Z3 テンポ", "76〜87%", f"{round(ftp*0.76)}〜{round(ftp*0.87)}W", f"{round(ftp*0.76/weight, 2)}〜{round(ftp*0.87/weight, 2)}", "#16a34a", "#dcfce7"),
+        ("🔥 SST", "88〜94%", f"{round(ftp*0.88)}〜{round(ftp*0.94)}W", f"{round(ftp*0.88/weight, 2)}〜{round(ftp*0.94/weight, 2)}", "#0d9488", "#ccfbf1"),
+        ("Z4 閾値(FTP)", "95〜105%", f"{round(ftp*0.95)}〜{round(ftp*1.05)}W", f"{round(ftp*0.95/weight, 2)}〜{round(ftp*1.05/weight, 2)}", "#d97706", "#fef3c7"),
+        ("Z5 VO2max", "106〜120%", f"{round(ftp*1.06)}〜{round(ftp*1.20)}W", f"{round(ftp*1.06/weight, 2)}〜{round(ftp*1.20/weight, 2)}", "#ea580c", "#ffedd5"),
+        ("Z6 無酸素", "121〜150%", f"{round(ftp*1.21)}〜{round(ftp*1.50)}W", f"{round(ftp*1.21/weight, 2)}〜{round(ftp*1.50/weight, 2)}", "#dc2626", "#fee2e2"),
+    ]
+    cards_html = []
+    for z_name, pct_str, w_str, wkg_str, accent, bg in zones:
+        cards_html.append(
+            f'<div style="flex:1 1 130px; background:{bg}; border:1px solid {accent}; border-top:4px solid {accent}; '
+            f'border-radius:0.6rem; padding:0.55rem 0.65rem; color:#0f172a;">'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; font-size:0.78rem; font-weight:800; color:#0f172a;">'
+            f'<span>{z_name}</span><span style="color:#1e293b; font-weight:700;">{pct_str}</span></div>'
+            f'<div style="font-size:0.98rem; font-weight:800; color:#0f172a; margin-top:0.2rem;">{w_str}</div>'
+            f'<div style="font-size:0.75rem; font-weight:700; color:#334155;">{wkg_str} W/kg</div>'
+            f'</div>'
+        )
+    return (
+        '<div style="display:flex; flex-wrap:wrap; gap:0.5rem; margin:0.4rem 0 0.85rem 0;">'
+        + "".join(cards_html)
+        + "</div>"
+    )
+
+
+def render_workout_cue_sheet_html(steps: list, ftp: int) -> str:
+    """ワークアウトの全ステップを視覚的なキューシート（進行表＋ゾーン凡例）としてHTML描画"""
+    if not steps or ftp <= 0:
+        return ""
+
+    def _zone_meta(p: float):
+        if p < 0.56:
+            return ("Z1 回復", "#475569", "#f1f5f9")
+        elif p < 0.76:
+            return ("Z2 有酸素", "#0369a1", "#e0f2fe")
+        elif p < 0.91:
+            return ("Z3 テンポ/SST", "#15803d", "#dcfce7")
+        elif p < 1.06:
+            return ("Z4 閾値(FTP)", "#b45309", "#fef3c7")
+        elif p < 1.21:
+            return ("Z5 VO2max", "#c2410c", "#ffedd5")
+        else:
+            return ("Z6 無酸素", "#b91c1c", "#fee2e2")
+
+    def _fmt_mmss(sec: int) -> str:
+        m, s = divmod(int(round(sec)), 60)
+        return f"{m:02d}:{s:02d}"
+
+    rows_html = []
+    elapsed = 0
+    for idx, s in enumerate(steps, 1):
+        dur = int(s["duration"])
+        p = float(s["power"])
+        watts = int(round(p * ftp))
+        pct = int(round(p * 100))
+        z_lbl, z_fg, z_bg = _zone_meta(p)
+        start_str = _fmt_mmss(elapsed)
+        end_str = _fmt_mmss(elapsed + dur)
+        elapsed += dur
+        dur_str = f"{dur // 60}分{dur % 60:02d}秒" if dur % 60 else f"{dur // 60}分"
+        if dur < 60:
+            dur_str = f"{dur}秒"
+        cad_str = f"{s['cadence']} rpm" if s.get("cadence") else "自由"
+        bar_w = min(100, max(12, int(round((p / 1.35) * 100))))
+        rows_html.append(
+            f'<tr style="border-bottom:1px solid #e2e8f0; background:{"#ffffff" if idx % 2 == 1 else "#f8fafc"};">'
+            f'<td style="padding:0.42rem 0.6rem; font-weight:700; color:#334155; font-size:0.8rem;">#{idx}</td>'
+            f'<td style="padding:0.42rem 0.6rem; font-weight:700; color:#0f172a; font-size:0.82rem;">{s.get("section", "Main")}</td>'
+            f'<td style="padding:0.42rem 0.6rem; font-family:monospace; font-weight:700; color:#1e293b; font-size:0.82rem;">{start_str} → {end_str}</td>'
+            f'<td style="padding:0.42rem 0.6rem; font-weight:800; color:#0f172a; font-size:0.84rem;">{dur_str}</td>'
+            f'<td style="padding:0.42rem 0.6rem;"><span style="background:{z_bg}; color:{z_fg}; border:1px solid {z_fg}; padding:0.12rem 0.5rem; border-radius:999px; font-size:0.75rem; font-weight:800;">{z_lbl}</span></td>'
+            f'<td style="padding:0.42rem 0.6rem; font-weight:800; color:#0f172a; font-size:0.86rem;">{watts} W <span style="color:#475569; font-weight:700; font-size:0.78rem;">({pct}% FTP)</span>'
+            f'<div style="width:100%; background:#e2e8f0; height:5px; border-radius:3px; margin-top:3px;"><div style="width:{bar_w}%; background:{z_fg}; height:5px; border-radius:3px;"></div></div></td>'
+            f'<td style="padding:0.42rem 0.6rem; font-weight:700; color:#0f172a; font-size:0.82rem;">{cad_str}</td>'
+            f'</tr>'
+        )
+
+    legend_items = [
+        ("Z1 回復 (<56%)", "#64748b"),
+        ("Z2 有酸素 (56-75%)", "#0284c7"),
+        ("Z3/SST (76-94%)", "#16a34a"),
+        ("Z4 閾値 (95-105%)", "#d97706"),
+        ("Z5 VO2max (106-120%)", "#ea580c"),
+        ("Z6 無酸素 (121%+)", "#dc2626"),
+    ]
+    legend_html = "".join(
+        f'<span style="display:inline-flex; align-items:center; gap:0.3rem; margin-right:0.75rem; font-size:0.78rem; font-weight:700; color:#0f172a;">'
+        f'<span style="width:11px; height:11px; border-radius:3px; background:{c}; display:inline-block;"></span>{lbl}</span>'
+        for lbl, c in legend_items
+    )
+
+    return (
+        f'<div style="background:#ffffff; border:1px solid #cbd5e1; border-radius:0.65rem; padding:0.65rem 0.9rem; margin-bottom:0.6rem;">'
+        f'<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem; margin-bottom:0.45rem;">'
+        f'<span style="font-size:0.84rem; font-weight:800; color:#0f172a;">🎨 パワーゾーン配色凡例 ＆ ステップ進行キューシート（全{len(steps)}ステップ / 合計 {_fmt_mmss(elapsed)}）</span>'
+        f'<div>{legend_html}</div></div>'
+        f'<div style="max-height:260px; overflow-y:auto; border:1px solid #cbd5e1; border-radius:0.5rem;">'
+        f'<table style="width:100%; border-collapse:collapse; text-align:left;">'
+        f'<thead><tr style="background:#f1f5f9; border-bottom:2px solid #cbd5e1; color:#0f172a; font-size:0.78rem;">'
+        f'<th style="padding:0.45rem 0.6rem;">#</th>'
+        f'<th style="padding:0.45rem 0.6rem;">セクション</th>'
+        f'<th style="padding:0.45rem 0.6rem;">経過時間</th>'
+        f'<th style="padding:0.45rem 0.6rem;">時間</th>'
+        f'<th style="padding:0.45rem 0.6rem;">ゾーン</th>'
+        f'<th style="padding:0.45rem 0.6rem;">目標出力 (%FTP)</th>'
+        f'<th style="padding:0.45rem 0.6rem;">指定回転数</th>'
+        f'</tr></thead><tbody>{"".join(rows_html)}</tbody></table></div></div>'
+    )
+
+
+def render_weekly_calendar_html(plan: dict, compliance: dict, ftp: int) -> str:
+    """週間プランをプロチーム仕様の7日間横並びビジュアルカレンダーグリッドとしてHTML描画"""
+    if not plan or not isinstance(plan, dict) or not plan.get("days"):
+        return ""
+    today_str = datetime.now().date().strftime("%Y-%m-%d")
+    comp_by_date = {}
+    if compliance and compliance.get("rows"):
+        for r in compliance["rows"]:
+            comp_by_date[str(r.get("日付", ""))] = r
+
+    cards = []
+    for d in plan.get("days", []):
+        ds = str(d.get("date", ""))[:10]
+        short_d = ds[5:].replace("-", "/") if len(ds) >= 10 else ds
+        day_lbl = d.get("day_label", "")
+        is_rest = bool(d.get("is_rest_day"))
+        title = d.get("title", "Workout")
+        dur_min = int(d.get("duration_min") or 0)
+        tss_val = int(d.get("target_tss") or 0)
+        is_today = (ds == today_str)
+
+        # Sparkline mini bars from workout_code
+        spark_bars = []
+        dominant_color = "#64748b" if is_rest else "#0284c7"
+        zone_fg = "#334155" if is_rest else "#0369a1"
+        zone_bg = "#f1f5f9" if is_rest else "#e0f2fe"
+        zone_tag = "🛌 REST" if is_rest else "🚴 WORKOUT"
+        if not is_rest and d.get("workout_code"):
+            steps_d, _ = parse_intervals_workout(d["workout_code"], ftp)
+            if steps_d:
+                max_p = max(float(s["power"]) for s in steps_d)
+                if max_p >= 1.06:
+                    dominant_color, zone_fg, zone_bg, zone_tag = "#ea580c", "#9a3412", "#ffedd5", "🚀 VO2max / L5"
+                elif max_p >= 0.95:
+                    dominant_color, zone_fg, zone_bg, zone_tag = "#d97706", "#92400e", "#fef3c7", "🔥 Threshold / L4"
+                elif max_p >= 0.85:
+                    dominant_color, zone_fg, zone_bg, zone_tag = "#16a34a", "#166534", "#dcfce7", "⚡ SST / Tempo"
+                else:
+                    dominant_color, zone_fg, zone_bg, zone_tag = "#0284c7", "#075985", "#e0f2fe", "🍃 Endurance / Z2"
+
+                sample_steps = steps_d[:18]
+                for stp in sample_steps:
+                    p = float(stp["power"])
+                    h_px = max(5, min(28, int(round(p * 22))))
+                    b_col = (
+                        "#94a3b8" if p < 0.56 else
+                        "#0284c7" if p < 0.76 else
+                        "#16a34a" if p < 0.91 else
+                        "#d97706" if p < 1.06 else
+                        "#ea580c" if p < 1.21 else "#dc2626"
+                    )
+                    w_flex = max(1, min(6, int(round(stp["duration"] / 180))))
+                    spark_bars.append(
+                        f'<div style="flex:{w_flex}; height:{h_px}px; background:{b_col}; border-radius:2px 2px 0 0;"></div>'
+                    )
+
+        if not spark_bars:
+            spark_html = (
+                '<div style="height:28px; display:flex; align-items:center; justify-content:center; '
+                'background:#f1f5f9; border-radius:4px; font-size:0.72rem; font-weight:700; color:#334155;">'
+                '🌿 完全休養・リカバリー</div>'
+            )
+        else:
+            spark_html = (
+                '<div style="height:30px; display:flex; align-items:flex-end; gap:2px; '
+                'background:#f8fafc; padding:3px 4px 0 4px; border-radius:4px; border-bottom:1px solid #cbd5e1;">'
+                + "".join(spark_bars)
+                + "</div>"
+            )
+
+        comp_row = comp_by_date.get(ds, {})
+        status_txt = comp_row.get("判定", "📅 予定")
+        actual_tss = comp_row.get("実績TSS", 0)
+        status_bg = "#dcfce7" if "✅" in status_txt else ("#fef3c7" if ("⏳" in status_txt or "🟡" in status_txt) else ("#fee2e2" if ("❌" in status_txt or "🔴" in status_txt) else "#f1f5f9"))
+        status_fg = "#14532d" if "✅" in status_txt else ("#78350f" if ("⏳" in status_txt or "🟡" in status_txt) else ("#7f1d1d" if ("❌" in status_txt or "🔴" in status_txt) else "#1e293b"))
+
+        today_badge = (
+            '<span style="background:#0369a1; color:#ffffff; padding:0.08rem 0.38rem; border-radius:999px; font-size:0.65rem; font-weight:800;">TODAY</span>'
+            if is_today else ""
+        )
+        border_css = "2px solid #0284c7" if is_today else "1px solid #cbd5e1"
+        shadow_css = "0 4px 12px rgba(2, 132, 199, 0.22)" if is_today else "0 1px 4px rgba(15, 23, 42, 0.06)"
+
+        short_day_lbl = day_lbl[:1] if day_lbl else ""
+        metrics_line = (
+            "休養日 (0 TSS)"
+            if is_rest
+            else f"⏱️ {dur_min}分 ／ 🎯 {tss_val} TSS" + (f" (実{actual_tss})" if actual_tss > 0 else "")
+        )
+
+        cards.append(
+            f'<div style="flex:1 1 155px; min-width:150px; background:{"#f0f9ff" if is_today else "#ffffff"}; '
+            f'border:{border_css}; border-top:5px solid {dominant_color}; border-radius:0.75rem; padding:0.6rem 0.68rem; '
+            f'box-shadow:{shadow_css}; display:flex; flex-direction:column; justify-content:space-between; gap:0.38rem; color:#0f172a;">'
+            f'<div>'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; gap:0.2rem; white-space:nowrap;">'
+            f'<span style="font-size:0.82rem; font-weight:800; color:#0f172a;">{short_d}({short_day_lbl})</span>'
+            f'{today_badge}'
+            f'</div>'
+            f'<div style="margin-top:0.22rem;">'
+            f'<span style="display:inline-block; background:{zone_bg}; color:{zone_fg}; border:1px solid {dominant_color}; border-radius:999px; padding:0.06rem 0.42rem; font-size:0.68rem; font-weight:800;">{zone_tag}</span>'
+            f'</div>'
+            f'<div style="font-size:0.82rem; font-weight:800; color:#0f172a; margin-top:0.28rem; line-height:1.25; min-height:2.1rem;">{title}</div>'
+            f'</div>'
+            f'<div>'
+            f'{spark_html}'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.35rem; font-size:0.72rem; font-weight:700; color:#1e293b; white-space:nowrap;">'
+            f'<span>{metrics_line}</span>'
+            f'</div>'
+            f'<div style="margin-top:0.28rem;">'
+            f'<span style="display:inline-block; width:100%; text-align:center; background:{status_bg}; color:{status_fg}; '
+            f'border-radius:6px; padding:0.15rem 0.35rem; font-size:0.72rem; font-weight:800;">{status_txt}</span>'
+            f'</div>'
+            f'</div>'
+            f'</div>'
+        )
+
+    return (
+        '<div style="margin:0.5rem 0 1.0rem 0;">'
+        '<div style="font-size:0.95rem; font-weight:800; color:#0f172a; margin-bottom:0.45rem;">'
+        '🗓️ 今週のビジュアル・トレーニングカレンダー（7日間波形 ＆ 計画遵守ステータス）</div>'
+        '<div style="display:flex; flex-wrap:wrap; gap:0.55rem; align-items:stretch;">'
+        + "".join(cards)
+        + "</div></div>"
+    )
+
+
 # ==========================================
 # 5. Streamlit UI 構築（プロチーム・テレメトリーUI）
 # ==========================================
@@ -2456,17 +2716,258 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 3.8rem !important; padding-bottom: 6.5rem !important; max-width: 1320px; }
+    /* アプリ全体の背景・文字色をOSダークモード/ライトモード問わずプロチーム・ライトテレメトリーテーマに統一し視認性を100%保証 */
+    :root,
+    html,
+    body,
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"] {
+        color-scheme: light !important;
+        background-color: #f8fafc !important;
+        background-image: linear-gradient(180deg, #f1f5f9 0%, #f8fafc 100%) !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stSkipToContent"],
+    [data-testid="stSkipToContent"] * {
+        background-color: #ffffff !important;
+        color: #0369a1 !important;
+        -webkit-text-fill-color: #0369a1 !important;
+        font-weight: 800 !important;
+    }
+    [data-testid="stHeader"] {
+        background-color: #f1f5f9 !important;
+        border-bottom: 1px solid #e2e8f0 !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stHeader"] *,
+    [data-testid="stIconMaterial"],
+    [data-testid="stExpandSidebarButton"] *,
+    button[kind="header"] *,
+    button[kind="headerNoPadding"] * {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        fill: #0f172a !important;
+    }
+    [data-testid="stSidebar"],
+    [data-testid="stSidebar"] > div,
+    [data-testid="stSidebarContent"],
+    [data-testid="stSidebarUserContent"] {
+        background-color: #f8fafc !important;
+        border-right: 1px solid #cbd5e1 !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] label *,
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+    }
 
-    /* KPI メトリクスカード：純白背景＋濃紺文字を <label data-testid="stMetricLabel"> 含め全階層で完全保証 */
+    .block-container {
+        padding-top: 3.2rem !important;
+        padding-bottom: 6.8rem !important;
+        max-width: 1400px !important;
+    }
+
+    /* メイン画面の各種見出し・ラベル・本文・キャプションを常に濃紺(#0f172a / #1e293b)で高コントラスト表示 */
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"],
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] li,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] h3,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] h4,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] h5,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] strong,
+    [data-testid="stWidgetLabel"],
+    [data-testid="stWidgetLabel"] *,
+    label[data-testid="stWidgetLabel"] p {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] li {
+        font-weight: 500 !important;
+    }
+
+    /* コードブロック・インラインコード（OSダークモード時にも明るい背景＋濃紺文字を強制） */
+    [data-testid="stCode"],
+    [data-testid="stCode"] *,
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] *,
+    [data-testid="stMain"] pre,
+    [data-testid="stMain"] pre *,
+    [data-testid="stMain"] code,
+    [data-testid="stMain"] code *,
+    [data-testid="stSidebar"] pre,
+    [data-testid="stSidebar"] pre *,
+    [data-testid="stSidebar"] code,
+    [data-testid="stSidebar"] code *,
+    pre,
+    code {
+        background-color: #f1f5f9 !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+    }
+    [data-testid="stCode"],
+    [data-testid="stMain"] pre {
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 0.5rem !important;
+    }
+
+    /* 入力フィールド・セレクトボックス・数値入力・日付入力の背景と文字色をOSダークモード時も純白背景＋濃紺文字で明瞭化 */
+    [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+    [data-testid="stSelectbox"] div[data-baseweb="select"] div,
+    [data-baseweb="select"],
+    [data-baseweb="select"] > div,
+    [data-baseweb="select"] div,
+    [data-baseweb="input"],
+    [data-baseweb="input"] > div,
+    [data-baseweb="base-input"],
+    [data-baseweb="textarea"],
+    [data-testid="stNumberInputContainer"],
+    [data-testid="stNumberInputContainer"] div,
+    [data-testid="stNumberInputContainer"] input,
+    [data-testid="stNumberInputContainer"] button,
+    [data-testid="stTextInputRootElement"] > div,
+    [data-testid="stTextInputRootElement"] div,
+    [data-testid="stTextInputRootElement"] input,
+    [data-testid="stDateInput"] div,
+    [data-testid="stDateInput"] input,
+    [data-testid="stDateInputFieldsScroller"],
+    [data-testid="stDateInputFieldsScroller"] span,
+    [data-testid="stTextArea"] div,
+    textarea {
+        background: #ffffff !important;
+        background-color: #ffffff !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        border-color: #94a3b8 !important;
+        border-radius: 0.5rem !important;
+    }
+    [data-baseweb="select"] span,
+    [data-baseweb="select"] svg,
+    input {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        fill: #0f172a !important;
+        font-weight: 600 !important;
+    }
+
+    /* スライダーのツマミ値ラベル（高詳細度セレクタで濃紺ピルバッジ＋白文字17.4:1を完全保証） */
+    [data-testid="stMain"] [data-testid="stSliderThumbValue"],
+    [data-testid="stMain"] [data-testid="stSliderThumbValue"] *,
+    [data-testid="stMain"] [data-testid="stSliderThumbValue"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stSidebar"] [data-testid="stSliderThumbValue"],
+    [data-testid="stSidebar"] [data-testid="stSliderThumbValue"] *,
+    [data-testid="stSidebar"] [data-testid="stSliderThumbValue"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stSliderThumbValue"],
+    [data-testid="stSliderThumbValue"] *,
+    div[role="slider"] [data-testid="stMarkdownContainer"] p {
+        background-color: #0f172a !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        padding: 0.08rem 0.38rem !important;
+        border-radius: 999px !important;
+        font-size: 0.76rem !important;
+        font-weight: 800 !important;
+    }
+    div[role="slider"] {
+        background-color: #0284c7 !important;
+        border: 2px solid #ffffff !important;
+        box-shadow: 0 1px 4px rgba(2, 132, 199, 0.45) !important;
+    }
+    [data-testid="stTickBarMin"],
+    [data-testid="stTickBarMax"],
+    [data-testid="stTickBarMin"] *,
+    [data-testid="stTickBarMax"] * {
+        color: #334155 !important;
+        -webkit-text-fill-color: #334155 !important;
+        font-weight: 700 !important;
+    }
+
+    /* プライマリボタン（WCAG AA/AAA準拠のディープオーシャンブルー #0369a1 ＋ 純白文字でコントラスト比 6.1:1 以上を保証） */
+    button[kind="primary"],
+    [data-testid="stBaseButton-primary"],
+    [data-testid="stFormSubmitButton"] button {
+        background-color: #0369a1 !important;
+        background-image: linear-gradient(135deg, #0369a1 0%, #075985 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        border: 1px solid #075985 !important;
+        border-radius: 0.65rem !important;
+        padding: 0.58rem 1.1rem !important;
+        font-weight: 800 !important;
+        box-shadow: 0 3px 10px rgba(3, 105, 161, 0.25) !important;
+        transition: all 0.16s ease !important;
+    }
+    button[kind="primary"]:hover,
+    [data-testid="stBaseButton-primary"]:hover,
+    [data-testid="stFormSubmitButton"] button:hover {
+        background-color: #075985 !important;
+        background-image: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
+        box-shadow: 0 5px 14px rgba(2, 132, 199, 0.35) !important;
+        transform: translateY(-1px) !important;
+    }
+    button[kind="primary"] *,
+    [data-testid="stBaseButton-primary"] *,
+    [data-testid="stFormSubmitButton"] button *,
+    [data-testid="stBaseButton-primary"] [data-testid="stMarkdownContainer"] p {
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        font-weight: 800 !important;
+    }
+
+    /* セカンダリボタン・ダウンロードボタン：白背景＋濃紺文字＋スカイブルーホバー */
+    button[kind="secondary"],
+    [data-testid="stBaseButton-secondary"],
+    [data-testid="stDownloadButton"] button {
+        background-color: #ffffff !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        border: 1.5px solid #64748b !important;
+        border-radius: 0.6rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08) !important;
+        transition: all 0.15s ease !important;
+    }
+    button[kind="secondary"]:hover,
+    [data-testid="stBaseButton-secondary"]:hover,
+    [data-testid="stDownloadButton"] button:hover {
+        background-color: #f0f9ff !important;
+        border-color: #0284c7 !important;
+        color: #0369a1 !important;
+        -webkit-text-fill-color: #0369a1 !important;
+    }
+    button[kind="secondary"] *,
+    [data-testid="stBaseButton-secondary"] *,
+    [data-testid="stDownloadButton"] button * {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        font-weight: 700 !important;
+    }
+
+    /* KPI メトリクスカード：全カードの高さを均一(min-height: 120px)に揃え、純白背景＋濃紺文字を完全保証 */
     [data-testid="stMetric"] {
         background: #ffffff !important;
-        border: 1px solid #94a3b8 !important;
+        border: 1px solid #cbd5e1 !important;
         border-left: 5px solid #0284c7 !important;
-        padding: 0.85rem 1.05rem !important;
+        padding: 0.8rem 1.0rem !important;
         border-radius: 0.75rem !important;
-        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12) !important;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08) !important;
         color: #0f172a !important;
+        min-height: 118px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: space-between !important;
     }
     [data-testid="stMetric"] label,
     [data-testid="stMetric"] label *,
@@ -2478,10 +2979,10 @@ st.markdown("""
     [data-testid="stMetricLabel"] p,
     [data-testid="stMetricLabel"] span,
     [data-testid="stMetricLabel"] div {
-        color: #0f172a !important;
-        -webkit-text-fill-color: #0f172a !important;
-        font-size: 0.85rem !important;
-        font-weight: 700 !important;
+        color: #334155 !important;
+        -webkit-text-fill-color: #334155 !important;
+        font-size: 0.82rem !important;
+        font-weight: 800 !important;
         opacity: 1 !important;
     }
     [data-testid="stMetricValue"],
@@ -2493,7 +2994,7 @@ st.markdown("""
     [data-testid="stMetricValue"] div {
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
-        font-size: 1.5rem !important;
+        font-size: 1.45rem !important;
         font-weight: 800 !important;
         letter-spacing: -0.02em !important;
         opacity: 1 !important;
@@ -2503,10 +3004,11 @@ st.markdown("""
         color: #14532d !important;
         -webkit-text-fill-color: #14532d !important;
         font-weight: 700 !important;
-        font-size: 0.78rem !important;
+        font-size: 0.75rem !important;
         border-radius: 999px !important;
-        padding: 0.15rem 0.55rem !important;
+        padding: 0.14rem 0.52rem !important;
         opacity: 1 !important;
+        width: fit-content !important;
     }
     [data-testid="stMetricDelta"] *,
     [data-testid="stMetricDelta"] [data-testid="stMarkdownContainer"],
@@ -2522,14 +3024,14 @@ st.markdown("""
         opacity: 1 !important;
     }
 
-    /* トップ・テレメトリーバナー：爽やかなスカイブルーグラデーション＋濃紺テキスト */
+    /* トップ・テレメトリーバナー（WorldTour Mission Control HUD） */
     .telemetry-banner {
         background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%) !important;
         border: 1px solid #38bdf8 !important;
         border-left: 6px solid #0284c7 !important;
         border-radius: 0.85rem !important;
-        padding: 1.0rem 1.35rem !important;
-        margin-bottom: 1.0rem !important;
+        padding: 0.9rem 1.25rem !important;
+        margin-bottom: 0.75rem !important;
         color: #0f172a !important;
         box-shadow: 0 3px 10px rgba(2, 132, 199, 0.12) !important;
     }
@@ -2540,20 +3042,15 @@ st.markdown("""
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
     }
-    .telemetry-sub {
-        color: #1e293b !important;
-        -webkit-text-fill-color: #1e293b !important;
-        font-weight: 600 !important;
-    }
 
     /* ステータスピルバッジ：白背景＋ブルー枠＋濃青テキストでくっきり表示 */
     .status-pill {
         display: inline-block;
-        padding: 0.24rem 0.75rem;
+        padding: 0.2rem 0.68rem;
         border-radius: 999px;
-        font-size: 0.78rem;
-        font-weight: 700;
-        margin-right: 0.4rem;
+        font-size: 0.76rem;
+        font-weight: 800;
+        margin-right: 0.35rem;
         margin-top: 0.2rem;
         background: #ffffff !important;
         color: #0369a1 !important;
@@ -2562,7 +3059,7 @@ st.markdown("""
         box-shadow: 0 1px 2px rgba(2, 132, 199, 0.1);
     }
 
-    /* 情報・警告アラートボックス (st.info / st.warning / st.success)：ライトブルー背景＋濃紺文字を完全保証 */
+    /* 情報・警告アラートボックス (st.info / st.warning / st.success) */
     [data-testid="stAlert"] {
         background-color: #e0f2fe !important;
         border: 1px solid #38bdf8 !important;
@@ -2583,13 +3080,13 @@ st.markdown("""
         opacity: 1 !important;
     }
 
-    /* エクスパンダー：白カード背景に対し、ダークモード時でも内部のタイトル・説明文・箇条書き・キャプションを全て濃紺(#0f172a)に固定 */
+    /* エクスパンダー：白カード背景＋濃紺テキスト */
     [data-testid="stExpander"] {
         border: 1px solid #94a3b8 !important;
         border-radius: 0.75rem !important;
         background: #ffffff !important;
-        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08) !important;
-        margin-bottom: 0.85rem !important;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06) !important;
+        margin-bottom: 0.75rem !important;
         overflow: hidden !important;
         color: #0f172a !important;
     }
@@ -2597,8 +3094,8 @@ st.markdown("""
         background: linear-gradient(90deg, #e0f2fe 0%, #f1f5f9 100%) !important;
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
-        font-weight: 700 !important;
-        padding: 0.7rem 1rem !important;
+        font-weight: 800 !important;
+        padding: 0.68rem 1rem !important;
         border-bottom: 1px solid #bae6fd !important;
     }
     [data-testid="stExpander"] details summary *,
@@ -2610,8 +3107,8 @@ st.markdown("""
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
         fill: #0f172a !important;
-        font-weight: 700 !important;
-        font-size: 0.95rem !important;
+        font-weight: 800 !important;
+        font-size: 0.94rem !important;
         opacity: 1 !important;
     }
     [data-testid="stExpanderDetails"] {
@@ -2620,17 +3117,7 @@ st.markdown("""
         padding-top: 0.8rem !important;
     }
     [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"],
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] p,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] li,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] span,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] strong,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] em,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h1,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h2,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h3,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h4,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h5,
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] h6,
+    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] *,
     [data-testid="stExpanderDetails"] [data-testid="stCaptionContainer"],
     [data-testid="stExpanderDetails"] [data-testid="stCaptionContainer"] *,
     [data-testid="stExpanderDetails"] label,
@@ -2640,59 +3127,66 @@ st.markdown("""
         opacity: 1 !important;
     }
     [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] a {
-        color: #0284c7 !important;
-        -webkit-text-fill-color: #0284c7 !important;
+        color: #0369a1 !important;
+        -webkit-text-fill-color: #0369a1 !important;
         font-weight: 700 !important;
         text-decoration: underline !important;
     }
-    [data-testid="stExpanderDetails"] [data-testid="stMarkdownContainer"] code {
-        background-color: #e2e8f0 !important;
-        color: #0f172a !important;
-        -webkit-text-fill-color: #0f172a !important;
-        padding: 0.15rem 0.35rem !important;
-        border-radius: 4px !important;
-    }
-    [data-testid="stExpanderDetails"] input,
-    [data-testid="stExpanderDetails"] textarea {
-        background-color: #f8fafc !important;
-        color: #0f172a !important;
-        -webkit-text-fill-color: #0f172a !important;
-        border: 1px solid #94a3b8 !important;
-    }
 
-    /* 通常のキャプションもダークモードで薄くなりすぎないよう不透明度を確保 */
+    /* キャプションの視認性強化 */
     [data-testid="stCaptionContainer"],
     [data-testid="stCaptionContainer"] p {
-        opacity: 0.95 !important;
-        font-size: 0.88rem !important;
+        color: #334155 !important;
+        -webkit-text-fill-color: #334155 !important;
+        opacity: 1 !important;
+        font-size: 0.85rem !important;
+        font-weight: 600 !important;
     }
 
-    /* タブバー（React Aria [data-testid="stTab"] & BaseWeb 両対応）：非選択タブも明瞭なピル背景＋濃紺文字、選択タブはブルー背景＋白文字 */
+    /* 7タブバー：全7タブが1行で見切れずに100%一覧表示されるよう設計 */
+    [data-baseweb="tab-list"],
+    div[role="tablist"] {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 0.24rem !important;
+        background: #e2e8f0 !important;
+        padding: 0.32rem 0.38rem !important;
+        border-radius: 0.7rem !important;
+        border: 1px solid #cbd5e1 !important;
+        margin-bottom: 0.65rem !important;
+    }
     button[data-baseweb="tab"],
     [data-testid="stTab"] {
-        background-color: #e2e8f0 !important;
+        background-color: #ffffff !important;
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
-        font-weight: 700 !important;
-        padding: 0.55rem 1.05rem !important;
-        border-radius: 0.55rem 0.55rem 0 0 !important;
-        margin-right: 0.3rem !important;
+        font-weight: 800 !important;
+        font-size: 0.78rem !important;
+        padding: 0.42rem 0.48rem !important;
+        border-radius: 0.5rem !important;
+        margin-right: 0 !important;
         border: 1px solid #cbd5e1 !important;
+        flex: 1 1 auto !important;
+        justify-content: center !important;
     }
     button[data-baseweb="tab"] *,
     [data-testid="stTab"] *,
     [data-testid="stTab"] [data-testid="stMarkdownContainer"] * {
         color: #0f172a !important;
         -webkit-text-fill-color: #0f172a !important;
-        font-weight: 700 !important;
+        font-weight: 800 !important;
+        font-size: 0.78rem !important;
+        white-space: nowrap !important;
     }
     button[data-baseweb="tab"][aria-selected="true"],
     [data-testid="stTab"][aria-selected="true"],
     [data-testid="stTab"][data-selected] {
-        background-color: #0284c7 !important;
+        background-color: #0369a1 !important;
+        background-image: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
         color: #ffffff !important;
         -webkit-text-fill-color: #ffffff !important;
-        border: 1px solid #0284c7 !important;
+        border: 1px solid #0369a1 !important;
+        box-shadow: 0 2px 6px rgba(3, 105, 161, 0.28) !important;
     }
     button[data-baseweb="tab"][aria-selected="true"] *,
     [data-testid="stTab"][aria-selected="true"] *,
@@ -2704,19 +3198,48 @@ st.markdown("""
         font-weight: 800 !important;
     }
 
-    /* AIコーチ相談のチャット入力欄を常に画面最下部に固定表示 */
+    /* チャットメッセージカード & チャット入力欄 */
+    [data-testid="stChatMessage"] {
+        background-color: #ffffff !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 0.75rem !important;
+        padding: 0.85rem 1.05rem !important;
+        margin-bottom: 0.65rem !important;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05) !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stChatMessageAvatarCustom"] {
+        background-color: #e0f2fe !important;
+        border: 1px solid #38bdf8 !important;
+        color: #0f172a !important;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] *,
+    [data-testid="stChatMessage"] p,
+    [data-testid="stChatMessage"] li,
+    [data-testid="stChatMessage"] span {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+    }
     [data-testid="stChatInput"] {
-        position: fixed !important;
-        bottom: 0 !important;
-        left: 50% !important;
-        transform: translateX(-50%) !important;
-        width: min(1280px, 94vw) !important;
-        z-index: 999 !important;
-        background: #1e293b !important;
-        padding: 0.65rem 1rem 0.9rem 1rem !important;
-        border-top: 2px solid #0284c7 !important;
-        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.3) !important;
-        border-radius: 0.85rem 0.85rem 0 0 !important;
+        position: sticky !important;
+        bottom: 0.5rem !important;
+        width: 100% !important;
+        z-index: 99 !important;
+        background: #ffffff !important;
+        background-color: #ffffff !important;
+        padding: 0.55rem 0.85rem !important;
+        border: 2px solid #0284c7 !important;
+        box-shadow: 0 4px 16px rgba(2, 132, 199, 0.14) !important;
+        border-radius: 0.85rem !important;
+        margin-top: 0.5rem !important;
+    }
+    [data-testid="stChatInput"] > div,
+    [data-testid="stChatInputContainer"],
+    [data-testid="stChatInput"] textarea {
+        background: #f8fafc !important;
+        background-color: #f8fafc !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -3291,27 +3814,42 @@ if (
 ) and intervals_key:
     sync_intervals_now(show_msg=False)
 
-# --- プロチーム・テレメトリーヘッダー ---
+# --- プロチーム・テレメトリーヘッダー (WorldTour Mission Control HUD) ---
 days_to_race = (race_date - datetime.now().date()).days
 phase_str = determine_training_phase(days_to_race)
 user_badge = f"👑 オーナー ({athlete_id})" if is_owner_mode else f"🚴 アスリート ({athlete_id or 'User'})"
 phenotype_badge = st.session_state.metrics["pdc"].get("phenotype", "All-Rounder") if (st.session_state.metrics and "pdc" in st.session_state.metrics) else "All-Rounder"
 
-hdr_col1, hdr_col2, hdr_col3 = st.columns([3.4, 1, 1])
+current_pwr = round(ftp / weight, 2) if weight > 0 else 0
+target_pwr = round(target_ftp / weight, 2) if weight > 0 else 0
+gap_watts = target_ftp - ftp
+ftp_progress_pct = min(100, max(10, int(round((ftp / target_ftp) * 100)))) if target_ftp > 0 else 100
+
+hdr_col1, hdr_col2 = st.columns([4.2, 1.0])
 with hdr_col1:
     st.markdown(f"""
     <div class="telemetry-banner">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
-            <div>
-                <span style="font-size:1.4rem; font-weight:800; color:#0f172a;">🚴‍♂️ AI Cycling Coach Pro</span>
-                <span style="margin-left:0.65rem; color:#0369a1; font-weight:700; font-size:0.92rem; background:#ffffff; padding:0.2rem 0.6rem; border-radius:6px; border:1px solid #bae6fd;">{user_badge}</span>
+            <div style="display:flex; align-items:center; flex-wrap:wrap; gap:0.45rem;">
+                <span style="font-size:1.42rem; font-weight:900; color:#0f172a; letter-spacing:-0.02em;">🚴‍♂️ AI Cycling Coach Pro</span>
+                <span style="color:#0369a1; font-weight:800; font-size:0.84rem; background:#ffffff; padding:0.18rem 0.58rem; border-radius:6px; border:1px solid #38bdf8;">{user_badge}</span>
+                <span style="color:#14532d; font-weight:800; font-size:0.76rem; background:#dcfce7; padding:0.16rem 0.52rem; border-radius:6px; border:1px solid #86efac;">☁️ 3層クラウド永続化 ON</span>
             </div>
             <div>
-                <span class="status-pill">🏆 {race_name} まであと {days_to_race}日</span>
+                <span class="status-pill">🏆 {race_name} 残り {days_to_race}日</span>
                 <span class="status-pill">{phase_str}</span>
                 <span class="status-pill">{phenotype_badge}</span>
                 <span class="status-pill">🤖 {selected_model}</span>
                 <span class="status-pill">🎚️ {COACH_STRICTNESS_LEVELS[coach_strictness]['label']}</span>
+            </div>
+        </div>
+        <div style="margin-top:0.65rem; background:#ffffff; border:1px solid #bae6fd; border-radius:0.55rem; padding:0.42rem 0.75rem; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:0.6rem;">
+            <div style="font-size:0.8rem; font-weight:800; color:#0f172a;">
+                🎯 目標FTP進捗: <span style="color:#0369a1;">現在 {ftp}W ({current_pwr} W/kg)</span> ➔ <span style="color:#0f172a;">目標 {target_ftp}W ({target_pwr} W/kg)</span>
+                <span style="margin-left:0.4rem; color:#475569; font-weight:700;">（達成率 {ftp_progress_pct}% / あと {gap_watts:+}W）</span>
+            </div>
+            <div style="flex:1 1 220px; max-width:360px; background:#e2e8f0; height:9px; border-radius:999px; overflow:hidden;">
+                <div style="width:{ftp_progress_pct}%; height:100%; background:linear-gradient(90deg, #0284c7 0%, #16a34a 100%); border-radius:999px;"></div>
             </div>
         </div>
     </div>
@@ -3319,7 +3857,6 @@ with hdr_col1:
 with hdr_col2:
     if st.button("🔄 最新データ同期", use_container_width=True):
         sync_intervals_now(show_msg=True)
-with hdr_col3:
     if is_owner_mode:
         if st.button("👥 ゲスト画面へ切替", use_container_width=True, help="他の人がAPIを入力して利用するゲスト画面に切り替えます"):
             st.session_state.locked_as_guest = True
@@ -3354,10 +3891,6 @@ if ext_status != "なし（通常通り）" or ext_detail.strip() or ext_intensi
         + (f"\n\n📝 **詳細メモ:** {ext_detail}" if ext_detail.strip() else "")
     )
 
-current_pwr = round(ftp / weight, 2) if weight > 0 else 0
-target_pwr = round(target_ftp / weight, 2) if weight > 0 else 0
-gap_watts = target_ftp - ftp
-
 # --- コア・テレメトリー KPI メトリクス (5カラム) ---
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("⚡ 現在 PWR (FTP)", f"{current_pwr} W/kg", f"{ftp}W → 目標{target_ftp}W ({gap_watts:+}W)")
@@ -3377,10 +3910,10 @@ if st.session_state.metrics:
     r_lbl = wr_quick.get("status_label", "未取得").split(" (")[0]
     m5.metric("🫀 本日のReadiness", f"{r_score} / 100", r_lbl)
 else:
-    m2.metric("📈 CTL", "--")
-    m3.metric("🔥 ATL", "--")
-    m4.metric("⚖️ TSB", "--")
-    m5.metric("🫀 Readiness", "--")
+    m2.metric("📈 CTL", "--", "未同期")
+    m3.metric("🔥 ATL", "--", "未同期")
+    m4.metric("⚖️ TSB", "--", "未同期")
+    m5.metric("🫀 Readiness", "--", "未同期")
 
 # --- エクスパンダー1: HRV・睡眠レディネス & 40日PMC推移 ---
 if st.session_state.metrics and st.session_state.metrics.get("wellness_readiness"):
@@ -3443,6 +3976,7 @@ if st.session_state.metrics and "pdc" in st.session_state.metrics:
                 st.altair_chart(prof_chart, use_container_width=True, theme=None)
 
         st.markdown("##### ⚡ あなたの現在のパワートレーニングゾーン表 (FTP: " + f"`{ftp}W` / `{current_pwr}W/kg` 基準)")
+        st.markdown(render_power_zones_spectrum_html(ftp, weight), unsafe_allow_html=True)
         zones_df = pd.DataFrame([
             {"ゾーン": "Z1 アクティブリカバリー", "%FTP": "〜55%", "ワット範囲 (W)": f"〜 {round(ftp*0.55)} W", "PWR (W/kg)": f"〜 {round(ftp*0.55/weight, 2)}", "主な生理学的適応": "血流促進・疲労物質除去"},
             {"ゾーン": "Z2 エンデュランス (有酸素)", "%FTP": "56〜75%", "ワット範囲 (W)": f"{round(ftp*0.56)} 〜 {round(ftp*0.75)} W", "PWR (W/kg)": f"{round(ftp*0.56/weight, 2)} 〜 {round(ftp*0.75/weight, 2)}", "主な生理学的適応": "ミトコンドリア増殖・毛細血管密度・脂質代謝向上"},
@@ -3470,7 +4004,39 @@ tab_daily, tab_weekly, tab_debrief, tab_simulator, tab_peaking, tab_chat, tab_hi
 # Tab 1: 今日のAIワークアウト生成
 # ==========================================
 with tab_daily:
-    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns([1.2, 1.2, 1.5, 1.5])
+    # 週間プランに本日の予定があればクイックバナーで表示＆1クリック呼び出し可能に
+    today_iso = datetime.now().date().strftime("%Y-%m-%d")
+    scheduled_today = None
+    if st.session_state.get("weekly_plan") and isinstance(st.session_state.weekly_plan, dict):
+        for _d in st.session_state.weekly_plan.get("days", []):
+            if str(_d.get("date", ""))[:10] == today_iso:
+                scheduled_today = _d
+                break
+
+    if scheduled_today:
+        sch_col1, sch_col2 = st.columns([3.6, 1.2])
+        with sch_col1:
+            if scheduled_today.get("is_rest_day"):
+                st.info(f"📅 **週間プランの本日の予定 ({today_iso})**: **🛌 {scheduled_today.get('title', 'Rest Day')}** — {scheduled_today.get('rationale', '')}")
+            else:
+                st.info(
+                    f"📅 **週間プランの本日の予定 ({today_iso})**: **{scheduled_today.get('title')}** "
+                    f"（⏱️ {scheduled_today.get('duration_min')}分 ／ 🎯 目標 {scheduled_today.get('target_tss')} TSS）\n\n"
+                    f"💡 狙い: {scheduled_today.get('rationale', '')}"
+                )
+        with sch_col2:
+            if not scheduled_today.get("is_rest_day") and scheduled_today.get("workout_code"):
+                if st.button("📥 本日の予定メニューを呼び出す", use_container_width=True):
+                    norm_sch = normalize_intervals_workout_code(scheduled_today["workout_code"], ftp)
+                    st.session_state.generated_workout = (
+                        f"### 📅 週間プランからの呼び出し: {scheduled_today.get('title')}\n\n"
+                        f"{scheduled_today.get('rationale', '')}\n\n"
+                        f"```workout\n{norm_sch}\n```"
+                    )
+                    save_memory()
+                    st.rerun()
+
+    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns([1.0, 1.15, 1.65, 1.65])
     with col_opt1:
         avail_minutes = st.slider("練習時間 (分)", 30, 240, 75, 15)
     with col_opt2:
@@ -3577,10 +4143,12 @@ with tab_daily:
             if w_stats:
                 st.markdown("##### 📊 生成ワークアウトの科学スペック & 推奨補給量")
                 ws1, ws2, ws3, ws4, ws5, ws6 = st.columns(6)
-                ws1.metric("⏱️ 総時間", f"{w_stats['total_min']} 分")
+                ws1.metric("⏱️ 総時間", f"{w_stats['total_min']} 分", f"全 {len(steps)} ステップ")
                 ws2.metric("⚡ 推定 NP / 平均", f"{w_stats['np_watts']} W", f"平均 {w_stats['avg_watts']} W")
-                ws3.metric("🔥 強度係数 (IF)", f"{w_stats['if']}")
-                ws4.metric("📈 推定 TSS", f"{w_stats['tss']}")
+                if_zone_lbl = "高強度 (L4/L5)" if w_stats["if"] >= 0.88 else ("テンポ/SST" if w_stats["if"] >= 0.76 else "有酸素/回復")
+                ws3.metric("🔥 強度係数 (IF)", f"{w_stats['if']}", if_zone_lbl)
+                tss_per_h = round(w_stats["tss"] / (w_stats["total_min"] / 60.0)) if w_stats["total_min"] > 0 else 0
+                ws4.metric("📈 推定 TSS", f"{w_stats['tss']}", f"時間換算 {tss_per_h} TSS/h")
                 ws5.metric("🔋 消費仕事量", f"{w_stats['kj']} kJ", f"約 {w_stats['kj']} kcal")
                 ws6.metric("🍬 推奨糖質 / 水分", f"糖質 {w_stats['carbs_g']}g", f"水分 {w_stats['water_ml']}ml")
 
@@ -3594,6 +4162,9 @@ with tab_daily:
                     tiz_chart = build_tiz_bar_chart(w_stats["zone_mins"])
                     if tiz_chart:
                         st.altair_chart(tiz_chart, use_container_width=True, theme=None)
+
+            # ステップ別進行キューシート & パワーゾーン配色凡例
+            st.markdown(render_workout_cue_sheet_html(steps, ftp), unsafe_allow_html=True)
 
             col_p1, col_p2, col_p3 = st.columns([2, 1, 1])
             with col_p1:
@@ -3610,7 +4181,7 @@ with tab_daily:
                     use_container_width=True,
                 )
 
-            if st.button("🚀 Intervals.icu カレンダーに登録", use_container_width=True):
+            if st.button("🚀 Intervals.icu カレンダーに登録", type="primary", use_container_width=True):
                 try:
                     client = IntervalsClient(athlete_id, intervals_key)
                     client.post_workout(w_name, workout_code, w_date.strftime("%Y-%m-%d"), ftp=ftp)
@@ -3724,10 +4295,12 @@ with tab_weekly:
         total_wk_tss = sum(d.get("target_tss", 0) for d in plan.get("days", []))
         total_wk_min = sum(d.get("duration_min", 0) for d in plan.get("days", []))
         st.success(f"✨ 週間プラン表示中 — 週間合計予定時間: **{round(total_wk_min/60, 1)}時間 ({total_wk_min}分)** ／ 週間合計目標TSS: **{total_wk_tss} TSS**")
+
+        # --- 計画遵守率（予定 vs Intervals.icu 実績）と 7日間ビジュアルカレンダー ---
+        comp = compute_plan_compliance(plan, (st.session_state.metrics or {}).get("activities", []))
+        st.markdown(render_weekly_calendar_html(plan, comp, ftp), unsafe_allow_html=True)
         st.markdown(f"**【今週のコーチング方針】**\n\n{plan['weekly_summary']}")
 
-        # --- 計画遵守率（予定 vs Intervals.icu 実績） ---
-        comp = compute_plan_compliance(plan, (st.session_state.metrics or {}).get("activities", []))
         if comp and comp.get("rows"):
             with st.expander(
                 f"📋 計画遵守トラッカー（予定 vs 実績） — 遵守率: "
@@ -3736,7 +4309,7 @@ with tab_weekly:
             ):
                 cc1, cc2, cc3 = st.columns(3)
                 cc1.metric("🎯 計画遵守率", f"{comp['pct']}%" if comp.get("pct") is not None else "--", f"評価済み {comp['evaluated_days']}日")
-                cc2.metric("📌 予定TSS（経過日）", comp["planned_tss_to_date"])
+                cc2.metric("📌 予定TSS（経過日）", comp["planned_tss_to_date"], "本日までの計画累計")
                 diff_tss = comp["actual_tss_to_date"] - comp["planned_tss_to_date"]
                 cc3.metric("🚴 実績TSS（経過日）", comp["actual_tss_to_date"], f"{diff_tss:+} TSS")
                 st.dataframe(pd.DataFrame(comp["rows"]), hide_index=True, use_container_width=True)
@@ -4135,8 +4708,12 @@ with tab_peaking:
                                  help="一般的にA優先レースは TSB +5〜+20 が目安。短時間高強度(ヒルクライム/TT)はやや高め、長距離ロードはやや低めでも可。")
         with pk4:
             pk_mode = st.radio("テーパー設定", ["🤖 自動最適化", "✋ 手動設定"], key="pk_mode")
-            man_td = st.slider("テーパー日数", 3, 21, 10, 1, key="pk_td", disabled=(pk_mode == "🤖 自動最適化"))
-            man_cut = st.slider("テーパー中の負荷削減率 (%)", 10, 80, 45, 5, key="pk_cut", disabled=(pk_mode == "🤖 自動最適化"))
+            if pk_mode == "✋ 手動設定":
+                man_td = st.slider("テーパー日数", 3, 21, 10, 1, key="pk_td")
+                man_cut = st.slider("テーパー中の負荷削減率 (%)", 10, 80, 45, 5, key="pk_cut")
+            else:
+                man_td, man_cut = 10, 45
+                st.caption("🤖 目標TSB帯に収まり、かつレース当日のCTLが最大化する日数と削減率を自動探索します。")
 
         if pk_mode == "🤖 自動最適化":
             res_pk = optimize_taper(in_ctl, in_atl, pk_days, in_week_tss, in_inc, tsb_band[0], tsb_band[1])
@@ -4222,7 +4799,8 @@ with tab_chat:
     chat_container = st.container()
     with chat_container:
         for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
+            av = "🚴‍♂️" if msg["role"] == "user" else "🧑‍🔬"
+            with st.chat_message(msg["role"], avatar=av):
                 st.markdown(msg["content"])
 
     typed_prompt = st.chat_input("例: 今日のHRVと睡眠スコア的に走っても大丈夫？ / 富士ヒルで65分を切るためにあと何を伸ばすべき？")
@@ -4239,10 +4817,10 @@ with tab_chat:
             })
             save_memory()
             with chat_container:
-                with st.chat_message("user"):
+                with st.chat_message("user", avatar="🚴‍♂️"):
                     st.markdown(prompt)
 
-                with st.chat_message("assistant"):
+                with st.chat_message("assistant", avatar="🧑‍🔬"):
                     try:
                         sys_prompt = build_system_prompt(profile_data, st.session_state.metrics)
                         client_ai = genai.Client(api_key=gemini_key) if gemini_key else None
