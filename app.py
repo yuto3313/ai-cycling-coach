@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import pandas as pd
 import json
@@ -74,7 +75,7 @@ DEFAULT_CONFIG = {
     "intervals_key": "",
     "gemini_key": "",
     "sarashina_key": "",
-    "model": "gemini-3.8-flash",
+    "model": "gemini-4-neon",
     "ftp": 280,
     "weight": 60.0,
     "target_ftp": 300,
@@ -166,11 +167,91 @@ def get_active_file_paths() -> tuple[str, str, str]:
     )
 
 
+APP_DEPLOY_URL = "https://ai-cycling-coach-ps662nnyskxx8krt7w7rnj.streamlit.app"
+
+MODEL_OPTIONS = [
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+    "sarashina3-mini",
+    "sarashina3-nano",
+    "カスタム指定...",
+]
+
+MODEL_DISPLAY_LABELS = {
+    "gemini-4-neon": "gemini-4-neon (⚡ Gemini 4 Neon｜高精度・推論バランス主力)",
+    "gemini-4-hydrogen": "gemini-4-hydrogen (🚀 Gemini 4 Hydrogen｜超高速・高コスパ)",
+    "gemini-4-argon": "gemini-4-argon (🧠 Gemini 4 Argon｜標準汎用)",
+    "gemini-4-carbon": "gemini-4-carbon (💎 Gemini 4 Carbon｜最上位フラッグシップ)",
+    "gemini-3.8-flash": "gemini-3.8-flash (Gemini 3.8 Flash｜高速・軽量)",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro-preview (Gemini 3.1 Pro)",
+    "sarashina3-mini": "sarashina3-mini (🇯🇵 Sarashina AI Mini)",
+    "sarashina3-nano": "sarashina3-nano (🇯🇵 Sarashina AI Nano)",
+    "カスタム指定...": "カスタム指定...",
+}
+
+KEEP_ALIVE_WORKFLOW_YAML = f"""name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # 6時間おきに自動起動（Streamlit Community Cloudの12〜24時間無通信スリープを完全防止・無料枠内）
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright Chromium
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Wake & Ping Streamlit App via Real Browser WebSocket
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          URL = "{APP_DEPLOY_URL}/?ping=1"
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+              print(f"Opening {{URL}} ...")
+              page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(5000)
+
+              # スリープ画面が出ていた場合は自動で「Yes, get this app back up!」ボタンを押下して起こす
+              wake_btn = page.locator("button:has-text('Yes, get this app back up')")
+              if wake_btn.count() > 0:
+                  print("App was sleeping! Clicking wake-up button...")
+                  wake_btn.first.click()
+                  page.wait_for_timeout(45000)
+              else:
+                  print("App is already awake! WebSocket session established.")
+
+              # アプリ本体（?ping=1 高速応答または stApp）の起動完了を確認
+              page.wait_for_selector('[data-testid="stApp"], text=Awake & Healthy', timeout=60000)
+              page.wait_for_timeout(3000)
+              print("Keep-alive succeeded:", page.title())
+              browser.close()
+          PY
+"""
+
+
 def _normalize_model_name(config: dict) -> dict:
     if config.get("model") in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]:
-        config["model"] = "gemini-3.8-flash"
-    elif config.get("model") in ["gemini-2.5-pro", "gemini-1.5-pro"]:
-        config["model"] = "gemini-3.1-pro"
+        config["model"] = "gemini-4-hydrogen"
+    elif config.get("model") in ["gemini-2.5-pro", "gemini-1.5-pro", "gemini-3.1-pro"]:
+        config["model"] = "gemini-4-neon"
     return config
 
 
@@ -520,7 +601,7 @@ class IntervalsClient:
             url,
             auth=self.auth,
             params={"oldest": CLOUD_SYNC_DATE, "newest": CLOUD_SYNC_DATE},
-            timeout=10,
+            timeout=5,
         )
         res.raise_for_status()
         events = res.json() or []
@@ -2291,8 +2372,14 @@ def _extract_json_str(raw_text: str) -> str:
 
 
 def get_candidate_models(primary_model: str, gemini_key: str = "", sarashina_key: str = "") -> list[str]:
-    """選択モデルを最優先にしつつ、クォータ制限時のフォールバック順序リスト（Sarashina & Gemini 両対応）を生成"""
-    gemini_defaults = ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-4-argon", "gemini-2.0-flash"]
+    """選択モデルを最優先にしつつ、クォータ制限時のフォールバック順序リスト（Sarashina & Gemini 4 両対応）を生成"""
+    gemini_defaults = [
+        "gemini-4-neon",
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-4-carbon",
+    ]
     sarashina_defaults = ["sarashina3-mini", "sarashina3-nano"]
 
     candidates = []
@@ -2712,6 +2799,29 @@ st.set_page_config(
     page_icon="🚴‍♂️",
     layout="wide",
     initial_sidebar_state="collapsed"
+)
+
+# ⚡ スリープ防止 Keep-Alive 高速応答エンドポイント (?ping=1)
+# GitHub Actions 等の自動アクセス時に重いAPI通信・描画をスキップし、WebSocket接続だけを確立して即座に応答する
+if st.query_params.get("ping") == "1":
+    st.markdown("### ✅ AI Cycling Coach Pro — Awake & Healthy")
+    st.caption(f"Keep-alive ping received at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.stop()
+
+# ブラウザタブ放置時のWebSocket無通信切断を軽減する軽量クライアント・ハートビート（4分間隔）
+components.html(
+    """<script>
+    (function(){
+      if (window.__aiCoachKeepAliveStarted) return;
+      window.__aiCoachKeepAliveStarted = true;
+      setInterval(function(){
+        if (document.visibilityState === 'visible') {
+          fetch('/_stcore/health', { cache: 'no-store' }).catch(function(){});
+        }
+      }, 240000);
+    })();
+    </script>""",
+    height=0,
 )
 
 st.markdown("""
@@ -3283,13 +3393,21 @@ is_owner_mode = (st.session_state.user_mode == "owner")
 cfg = load_config()
 mem = load_memory()
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_fetch_cloud_state(athlete_id: str, key_fingerprint: str, _intervals_key: str) -> dict:
+    """再オープン時の起動待ちを短縮するため、クラウド設定の取得結果を120秒キャッシュ"""
+    client = IntervalsClient(athlete_id, _intervals_key)
+    return client.fetch_cloud_state()
+
+
 # サーバー再起動・スリープ復帰・別端末アクセス時に Intervals.icu クラウドバックアップから設定と記憶を自動復元
 _restore_flag_key = f"_cloud_restored_{st.session_state.get('user_mode', 'owner')}_{st.session_state.get('guest_uid', '')}"
 if not st.session_state.get(_restore_flag_key) and cfg.get("intervals_key"):
     st.session_state[_restore_flag_key] = True
     try:
         _c_client = IntervalsClient(cfg.get("athlete_id", ""), cfg.get("intervals_key", ""))
-        _c_state = _c_client.fetch_cloud_state()
+        _key_fp = hashlib.sha256(cfg.get("intervals_key", "").encode("utf-8")).hexdigest()[:12]
+        _c_state = _cached_fetch_cloud_state(cfg.get("athlete_id", ""), _key_fp, cfg.get("intervals_key", ""))
         if _c_state.get("cfg_event_id"):
             st.session_state["_cloud_cfg_event_id"] = _c_state["cfg_event_id"]
         if _c_state.get("mem_event_id"):
@@ -3406,6 +3524,16 @@ with st.sidebar:
                 cfg["public_default_guest"] = pub_default
                 save_config(cfg)
                 st.success("セキュリティ設定を更新しました！")
+
+        with st.expander("⚡ スリープ防止（24時間常時起動）設定"):
+            st.caption("Streamlit Cloudの無通信スリープ（起動待ち30〜60秒）を完全防止するには、下の `keep_alive.yml` をGitHubリポジトリの `.github/workflows/keep_alive.yml` に置くだけでOKです（完全無料・6時間ごとに自動アクセス）。")
+            st.download_button(
+                "📥 keep_alive.yml をダウンロード",
+                data=KEEP_ALIVE_WORKFLOW_YAML,
+                file_name="keep_alive.yml",
+                mime="text/yaml",
+                use_container_width=True,
+            )
     else:
         # ゲスト画面ではオーナー画面への切り替えボタン等を一切表示しない
         pub_default = bool(owner_cfg.get("public_default_guest", False))
@@ -3458,27 +3586,22 @@ with st.sidebar:
         gemini_key = st.text_input("Gemini API Key (Gemini利用時)", value=cfg.get("gemini_key", ""), type="password")
         sarashina_key = st.text_input("Sarashina AI API Key (Sarashina利用時)", value=cfg.get("sarashina_key", ""), type="password", placeholder="hki_v1_...")
 
-    model_options = [
-        "gemini-3.8-flash",
-        "gemini-3.1-pro",
-        "gemini-4-argon",
-        "sarashina3-mini",
-        "sarashina3-nano",
-        "カスタム指定...",
-    ]
-    cur_model = cfg.get("model", "gemini-3.8-flash")
+    model_options = MODEL_OPTIONS
+    cur_model = cfg.get("model", "gemini-4-neon")
     idx_model = model_options.index(cur_model) if cur_model in model_options else (len(model_options) - 1 if cur_model else 0)
     selected_option = st.selectbox(
-        "🤖 AIモデル選択 (Gemini / Sarashina AI)",
+        "🤖 AIモデル選択 (Gemini 4 / Sarashina AI)",
         model_options,
         index=idx_model,
-        help="Google Gemini シリーズおよび SB Intuitions 国産LLM『Sarashina AI (sarashina3-mini / sarashina3-nano)』を選択できます。利用枠制限（429）時は設定済みの別モデルへ自動フォールバックします。"
+        format_func=lambda m: MODEL_DISPLAY_LABELS.get(m, m),
+        help="最新の Google Gemini 4（Neon / Hydrogen / Argon / Carbon）および国産LLM『Sarashina AI』を選択できます。利用枠制限（429）時は設定済みの別モデルへ自動フォールバックします。"
     )
     if selected_option == "カスタム指定...":
-        custom_model = st.text_input("モデルIDを入力 (例: sarashina3-mini 等)", value=cur_model if cur_model not in model_options else "sarashina3-mini")
+        custom_model = st.text_input("モデルIDを入力 (例: gemini-4-neon / gemini-4-hydrogen 等)", value=cur_model if cur_model not in model_options else "gemini-4-neon")
         selected_model = custom_model.strip()
     else:
         selected_model = selected_option
+    st.caption("💡 **Neon**: 高度な分析・週間プラン＆メニュー設計向き ／ **Hydrogen**: 超高速・普段のチャット相談向き")
 
     if is_sarashina_model(selected_model) and not sarashina_key:
         st.warning("⚠️ Sarashina AI が選択されています。上の「Sarashina AI API Key」を入力し、下の「💾 設定を保存する」を押してください。")
