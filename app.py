@@ -7,6 +7,7 @@ import os
 import re
 import math
 import hashlib
+import hmac
 import statistics
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -62,7 +63,6 @@ PERSISTED_PROFILE_KEYS = [
     "ext_detail",
     "ext_intensity_cap",
     "coach_strictness",
-    "public_default_guest",
     "updated_at",
 ]
 
@@ -91,8 +91,9 @@ DEFAULT_CONFIG = {
     "ext_intensity_cap": "制限なし（コンディションに応じる）",
     # AIコーチの厳しさレベル (1〜5)
     "coach_strictness": 3,
-    # 公開設定
-    "public_default_guest": False,
+    # 公開・セキュリティ設定（デフォルトTrue：トークンなしの通常URL・ゲストURLは必ずゲスト画面にし、オーナー画面への誤遷移を完全防止）
+    "require_owner_token": True,
+    "public_default_guest": True,
     "updated_at": 0.0,
 }
 
@@ -150,10 +151,71 @@ def compute_owner_token(owner_intervals_key: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _xor_keystream(length: int, salt: str, nonce: bytes) -> bytes:
+    out = bytearray()
+    counter = 0
+    salt_b = salt.encode("utf-8")
+    while len(out) < length:
+        block = hashlib.sha256(salt_b + b":" + nonce + b":" + counter.to_bytes(4, "big")).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:length])
+
+
+def encode_guest_key_param(config: dict, secret_salt: str) -> str:
+    """ゲスト本人のAPIキー情報をHMAC署名付き暗号化トークンに変換（コンテナ再起動後も本人専用URLから自動復元するため）"""
+    ikey = (config.get("intervals_key") or "").strip()
+    if not ikey:
+        return ""
+    try:
+        payload = {
+            "a": (config.get("athlete_id") or "").strip(),
+            "i": ikey,
+            "g": (config.get("gemini_key") or "").strip(),
+            "s": (config.get("sarashina_key") or "").strip(),
+        }
+        raw = zlib.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), level=9)
+        nonce = os.urandom(8)
+        ks = _xor_keystream(len(raw), secret_salt, nonce)
+        cipher = bytes(a ^ b for a, b in zip(raw, ks))
+        tag = hmac.new(secret_salt.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()[:8]
+        return base64.urlsafe_b64encode(nonce + tag + cipher).decode("ascii").rstrip("=")
+    except Exception:
+        return ""
+
+
+def decode_guest_key_param(token: str, secret_salt: str) -> dict:
+    """暗号化ゲストトークン (?gkey=...) を検証・復号してAPIキー辞書を返す"""
+    if not token or not isinstance(token, str):
+        return {}
+    try:
+        pad = "=" * ((4 - len(token) % 4) % 4)
+        blob = base64.urlsafe_b64decode((token + pad).encode("ascii"))
+        if len(blob) < 17:
+            return {}
+        nonce, tag, cipher = blob[:8], blob[8:16], blob[16:]
+        expected_tag = hmac.new(secret_salt.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()[:8]
+        if not hmac.compare_digest(tag, expected_tag):
+            return {}
+        ks = _xor_keystream(len(cipher), secret_salt, nonce)
+        raw = bytes(a ^ b for a, b in zip(cipher, ks))
+        data = json.loads(zlib.decompress(raw).decode("utf-8"))
+        if isinstance(data, dict) and data.get("i"):
+            return {
+                "athlete_id": str(data.get("a") or ""),
+                "intervals_key": str(data.get("i") or ""),
+                "gemini_key": str(data.get("g") or ""),
+                "sarashina_key": str(data.get("s") or ""),
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def get_active_file_paths() -> tuple[str, str, str]:
     """現在のセッションモード（owner または guest）に応じた (config_path, cache_path, memory_path) を返す"""
-    mode = st.session_state.get("user_mode", "owner")
-    if mode == "owner":
+    mode = st.session_state.get("user_mode", "guest")
+    if mode == "owner" and not st.session_state.get("locked_as_guest", False):
         return CONFIG_FILE, CACHE_FILE, MEMORY_FILE
     uid = st.session_state.get("guest_uid", "")
     if not uid:
@@ -255,8 +317,16 @@ def _normalize_model_name(config: dict) -> dict:
     return config
 
 
-def load_owner_config() -> dict:
-    """オーナー（自分）専用の設定を config.json、st.secrets、URLクエリパラメータから読み込む"""
+def _get_guest_cipher_salt() -> str:
+    """ゲストURL用暗号化ソルト（オーナーシークレット由来の固定値・コンテナ再起動でも不変）"""
+    salt = st.session_state.get("_guest_cipher_salt", "")
+    if salt:
+        return salt
+    return "ai-cycling-coach-pro-guest-salt-v1"
+
+
+def load_owner_config(allow_query_cfg: bool = False) -> dict:
+    """オーナー（自分）専用の設定を config.json、st.secrets から読み込む（ゲストURLの ?cfg= で汚染されないよう分離）"""
     config = DEFAULT_CONFIG.copy()
     # 1. st.secrets に設定値があればフォールバック初期値として読み込む
     try:
@@ -283,27 +353,28 @@ def load_owner_config() -> dict:
     except Exception:
         pass
 
-    # 4. セッションメモリ内またはURLパラメータ (?cfg=...) に新しい設定があれば復元
-    if "active_owner_config" in st.session_state and isinstance(st.session_state.active_owner_config, dict):
-        mem_cfg = st.session_state.active_owner_config
-        if float(mem_cfg.get("updated_at") or 0) >= float(config.get("updated_at") or 0):
-            config.update(mem_cfg)
+    # 4. オーナー認証済みセッションのみ、セッションメモリやURLパラメータ (?cfg=...) を反映
+    if allow_query_cfg:
+        if "active_owner_config" in st.session_state and isinstance(st.session_state.active_owner_config, dict):
+            mem_cfg = st.session_state.active_owner_config
+            if float(mem_cfg.get("updated_at") or 0) >= float(config.get("updated_at") or 0):
+                config.update(mem_cfg)
 
-    try:
-        q_cfg = decode_cfg_param(st.query_params.get("cfg", ""))
-        if q_cfg and float(q_cfg.get("updated_at") or 0) > float(config.get("updated_at") or 0):
-            config.update(q_cfg)
-    except Exception:
-        pass
+        try:
+            q_cfg = decode_cfg_param(st.query_params.get("cfg", ""))
+            if q_cfg and float(q_cfg.get("updated_at") or 0) > float(config.get("updated_at") or 0):
+                config.update(q_cfg)
+        except Exception:
+            pass
 
     return _normalize_model_name(config)
 
 
 def load_config() -> dict:
-    """現在のログインユーザー（オーナー または ゲスト）の設定を読み込む"""
-    mode = st.session_state.get("user_mode", "owner")
-    if mode == "owner":
-        return load_owner_config()
+    """現在のログインユーザー（オーナー または ゲスト）の設定を読み込む（デフォルトは常に安全側の guest）"""
+    mode = st.session_state.get("user_mode", "guest")
+    if mode == "owner" and not st.session_state.get("locked_as_guest", False):
+        return load_owner_config(allow_query_cfg=True)
 
     # ゲスト（他の人）モードの場合：オーナーのキーや設定は一切読み込まない
     config = DEFAULT_CONFIG.copy()
@@ -319,6 +390,11 @@ def load_config() -> dict:
     if "guest_config" in st.session_state and isinstance(st.session_state.guest_config, dict):
         if float(st.session_state.guest_config.get("updated_at") or 0) >= float(config.get("updated_at") or 0):
             config.update(st.session_state.guest_config)
+        elif not config.get("intervals_key") and st.session_state.guest_config.get("intervals_key"):
+            # コンテナ再起動直後などローカルにキーがない場合、gkey復元済みのAPIキーを必ず引き継ぐ
+            for _ak in ["athlete_id", "intervals_key", "gemini_key", "sarashina_key"]:
+                if st.session_state.guest_config.get(_ak):
+                    config[_ak] = st.session_state.guest_config[_ak]
 
     try:
         q_cfg = decode_cfg_param(st.query_params.get("cfg", ""))
@@ -335,19 +411,35 @@ def save_config(new_config: dict, sync_cloud: bool = True):
     new_config = new_config.copy()
     new_config["updated_at"] = round(time.time(), 2)
 
-    mode = st.session_state.get("user_mode", "owner")
-    if mode == "owner":
+    mode = st.session_state.get("user_mode", "guest")
+    is_owner_now = (mode == "owner" and not st.session_state.get("locked_as_guest", False))
+
+    if is_owner_now:
         st.session_state.active_owner_config = new_config.copy()
+        try:
+            for _drop_k in ("mode", "uid", "gkey"):
+                if _drop_k in st.query_params:
+                    del st.query_params[_drop_k]
+            _otok = compute_owner_token(new_config.get("intervals_key", ""))
+            if _otok:
+                st.query_params["token"] = _otok
+        except Exception:
+            pass
     else:
         st.session_state.guest_config = new_config.copy()
         uid = compute_user_uid(new_config.get("intervals_key", ""), new_config.get("athlete_id", ""))
-        if uid:
-            st.session_state.guest_uid = uid
-            try:
-                st.query_params["mode"] = "guest"
+        try:
+            if "token" in st.query_params:
+                del st.query_params["token"]
+            st.query_params["mode"] = "guest"
+            if uid:
+                st.session_state.guest_uid = uid
                 st.query_params["uid"] = uid
-            except Exception:
-                pass
+                gkey_tok = encode_guest_key_param(new_config, _get_guest_cipher_salt())
+                if gkey_tok:
+                    st.query_params["gkey"] = gkey_tok
+        except Exception:
+            pass
 
     # URLクエリパラメータ (?cfg=...) にも圧縮スナップショットを保持（アイドル再接続時の即時復元用）
     try:
@@ -480,6 +572,10 @@ def load_metrics_cache():
 
 def reload_user_session_data():
     """ユーザー切り替え時に、現在のユーザー用のキャッシュと記憶をセッションに再ロードする"""
+    st.session_state.pop("_cloud_cfg_event_id", None)
+    st.session_state.pop("_cloud_mem_event_id", None)
+    for _k in [k for k in list(st.session_state.keys()) if str(k).startswith("_cloud_restored_")]:
+        st.session_state.pop(_k, None)
     mem = load_memory()
     st.session_state.metrics = load_metrics_cache()
     st.session_state.messages = mem.get("messages", [])
@@ -3354,36 +3450,55 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- マルチユーザー & オーナー自動ログイン判定（ゲスト画面からオーナー画面への侵入を完全遮断） ---
-owner_cfg = load_owner_config()
+# --- マルチユーザー & 厳格アクセス制御（ゲストURL・通常URLからオーナー画面への誤遷移を100%遮断） ---
+owner_cfg = load_owner_config(allow_query_cfg=False)
 owner_master_token = compute_owner_token(owner_cfg.get("intervals_key", ""))
-q_mode = st.query_params.get("mode", "")
-q_uid = st.query_params.get("uid", "")
-q_token = st.query_params.get("token", "")
+guest_cipher_salt = owner_master_token or "ai-cycling-coach-pro-guest-salt-v1"
+st.session_state["_guest_cipher_salt"] = guest_cipher_salt
 
-# 1. URLに ?mode=guest が指定された場合、または一度でもゲストモードに入ったセッションは locked_as_guest = True にロック
-if q_mode == "guest" or q_uid:
+q_mode = str(st.query_params.get("mode", "")).strip().lower()
+q_uid = str(st.query_params.get("uid", "")).strip()
+q_gkey = str(st.query_params.get("gkey", "")).strip()
+q_token = str(st.query_params.get("token", "")).strip()
+
+# 最優先ルール1: URLに mode=guest / uid / gkey が含まれる場合は、token の有無に関わらず無条件でゲストモード固定
+if q_mode == "guest" or q_uid or q_gkey:
     st.session_state.locked_as_guest = True
     st.session_state.user_mode = "guest"
     if q_uid:
         st.session_state.guest_uid = q_uid
-
-# 2. 正しいオーナートークン (?token=...) がURLにある場合のみロック解除を許可
-if owner_master_token and q_token == owner_master_token:
+    # サーバー再起動で user_data/ が初期化されていても、gkey からゲスト本人の認証情報を自動復元
+    if q_gkey:
+        _restored_keys = decode_guest_key_param(q_gkey, guest_cipher_salt)
+        if _restored_keys and _restored_keys.get("intervals_key"):
+            _r_uid = compute_user_uid(_restored_keys["intervals_key"], _restored_keys.get("athlete_id", ""))
+            _is_owner_key = bool(
+                owner_cfg.get("intervals_key")
+                and _restored_keys["intervals_key"].strip() == owner_cfg.get("intervals_key", "").strip()
+            )
+            if _r_uid and (not q_uid or q_uid == _r_uid) and not _is_owner_key:
+                st.session_state.guest_uid = _r_uid
+                _cur_gcfg = st.session_state.get("guest_config") or {}
+                if not _cur_gcfg.get("intervals_key"):
+                    _merged = DEFAULT_CONFIG.copy()
+                    _merged.update(_restored_keys)
+                    _merged["updated_at"] = 0.0
+                    st.session_state.guest_config = _merged
+# ルール2: ゲスト指定がなく、かつ有効なオーナートークン (?token=...) が完全一致する場合のみオーナーモードを許可
+elif owner_master_token and q_token and hmac.compare_digest(q_token, owner_master_token):
     st.session_state.locked_as_guest = False
     st.session_state.user_mode = "owner"
-
-if "user_mode" not in st.session_state:
+# ルール3: パラメータなしの通常URL (/) で開かれた場合（デフォルトは必ずゲストログイン画面：Fail-Closed）
+elif "user_mode" not in st.session_state:
     if st.session_state.get("locked_as_guest", False):
         st.session_state.user_mode = "guest"
-    elif owner_cfg.get("public_default_guest", False) or not owner_cfg.get("intervals_key"):
+    elif owner_cfg.get("require_owner_token", True) or not owner_cfg.get("intervals_key"):
         st.session_state.locked_as_guest = True
         st.session_state.user_mode = "guest"
     else:
-        # オーナーが通常URLを開いた場合は今まで通り自動ログイン
         st.session_state.user_mode = "owner"
 
-# もし locked_as_guest が True なのに user_mode が owner になっていたら強制的に guest に戻す
+# 最終防壁: locked_as_guest が True のセッションは絶対に owner にさせない
 if st.session_state.get("locked_as_guest", False):
     st.session_state.user_mode = "guest"
 
@@ -3501,27 +3616,27 @@ with st.sidebar:
             st.session_state.guest_uid = ""
             st.session_state.guest_config = {}
             try:
+                st.query_params.clear()
                 st.query_params["mode"] = "guest"
-                if "uid" in st.query_params:
-                    del st.query_params["uid"]
             except Exception:
                 pass
             reload_user_session_data()
             st.rerun()
 
         with st.expander("🔗 他の人への共有URL ＆ セキュリティ設定"):
-            st.caption("① 他の人に共有する招待URL（このURLからはオーナー画面には絶対に入れません）：")
-            st.code("https://ai-cycling-coach-ps662nnyskxx8krt7w7rnj.streamlit.app/?mode=guest", language="text")
+            st.caption("① 友人・他の人に共有する招待URL（素のURLを開いても自動でゲスト画面になり、オーナー画面には絶対に入りません）：")
+            st.code(f"{APP_DEPLOY_URL}/?mode=guest", language="text")
             if owner_master_token:
-                st.caption("② あなた専用の暗号化トークン付き自動ログインURL（ブックマーク推奨）：")
-                st.code(f"https://ai-cycling-coach-ps662nnyskxx8krt7w7rnj.streamlit.app/?token={owner_master_token}", language="text")
-            pub_default = st.checkbox(
-                "🔒 通常URL（パラメータなし）もゲスト入力画面にする",
-                value=bool(cfg.get("public_default_guest", False)),
-                help="ONにすると、パラメータなしのURLを開いた人も全員ゲスト画面になり、あなたは上の ?token=... 付きURL（または自分のIntervals API Key入力）でのみオーナー画面に入れます。"
+                st.caption("② あなた専用の自動ログインURL（※共有厳禁・ご自身のブックマーク専用）：")
+                st.code(f"{APP_DEPLOY_URL}/?token={owner_master_token}", language="text")
+            req_tok = st.checkbox(
+                "🔒 通常URL（パラメータなし）もゲスト入力画面にする（推奨・デフォルトON）",
+                value=bool(cfg.get("require_owner_token", True)),
+                help="ON（推奨）にすると、パラメータなしの通常URLを開いた人も全員ゲスト画面になり、オーナーは上の ?token=... 付きURL（または自分のIntervals API Key入力）でのみオーナー画面に入れます。"
             )
-            if pub_default != bool(cfg.get("public_default_guest", False)):
-                cfg["public_default_guest"] = pub_default
+            if req_tok != bool(cfg.get("require_owner_token", True)):
+                cfg["require_owner_token"] = req_tok
+                cfg["public_default_guest"] = req_tok
                 save_config(cfg)
                 st.success("セキュリティ設定を更新しました！")
 
@@ -3536,18 +3651,21 @@ with st.sidebar:
             )
     else:
         # ゲスト画面ではオーナー画面への切り替えボタン等を一切表示しない
-        pub_default = bool(owner_cfg.get("public_default_guest", False))
+        req_tok = bool(owner_cfg.get("require_owner_token", True))
         if cfg.get("intervals_key") and (cfg.get("gemini_key") or cfg.get("sarashina_key")):
             st.info(f"🚴 ログイン中 (ID: {cfg.get('athlete_id') or '自動取得'})")
-            if st.session_state.get("guest_uid"):
-                st.caption("💡 現在のURL（`?mode=guest&uid=...`）をブックマークすると次回から自動ログインできます。")
+            _my_uid = st.session_state.get("guest_uid") or compute_user_uid(cfg.get("intervals_key", ""), cfg.get("athlete_id", ""))
+            _my_gkey = encode_guest_key_param(cfg, guest_cipher_salt)
+            if _my_uid and _my_gkey:
+                with st.expander("🔖 あなた専用の次回自動ログインURL（ブックマーク推奨）"):
+                    st.caption("下のURLをブックマークすると、サーバー再起動後でも再入力なしで**あなた専用画面**が開きます（※ご自身のAPIキーを含むため他人へは共有しないでください）。")
+                    st.code(f"{APP_DEPLOY_URL}/?mode=guest&uid={_my_uid}&gkey={_my_gkey}", language="text")
             if st.button("🚪 ログアウト / APIキー再入力", use_container_width=True):
                 st.session_state.guest_uid = ""
                 st.session_state.guest_config = {}
                 try:
+                    st.query_params.clear()
                     st.query_params["mode"] = "guest"
-                    if "uid" in st.query_params:
-                        del st.query_params["uid"]
                 except Exception:
                     pass
                 reload_user_session_data()
@@ -3696,13 +3814,14 @@ with st.sidebar:
         "ext_detail": ext_detail,
         "ext_intensity_cap": ext_intensity_cap,
         "coach_strictness": coach_strictness,
-        "public_default_guest": pub_default,
+        "require_owner_token": req_tok if is_owner_mode else True,
+        "public_default_guest": req_tok if is_owner_mode else True,
         "updated_at": cfg.get("updated_at", 0.0),
     }
 
     # サイドバーの項目が1つでも変更されたら即座に自動保存＆クラウド同期（未操作後の再起動による初期化を完全防止）
     _watch_keys = [k for k in PERSISTED_PROFILE_KEYS if k != "updated_at"] + ["intervals_key", "gemini_key", "sarashina_key"]
-    if any(current_cfg_dict.get(k) != cfg.get(k) for k in _watch_keys):
+    if (is_owner_mode or bool(intervals_key.strip())) and any(current_cfg_dict.get(k) != cfg.get(k) for k in _watch_keys):
         save_config(current_cfg_dict, sync_cloud=True)
         cfg = load_config()
         st.toast("💾 設定変更を自動保存しました（クラウド同期済）")
@@ -3987,9 +4106,8 @@ with hdr_col2:
             st.session_state.guest_uid = ""
             st.session_state.guest_config = {}
             try:
+                st.query_params.clear()
                 st.query_params["mode"] = "guest"
-                if "uid" in st.query_params:
-                    del st.query_params["uid"]
             except Exception:
                 pass
             reload_user_session_data()
@@ -3999,9 +4117,8 @@ with hdr_col2:
             st.session_state.guest_uid = ""
             st.session_state.guest_config = {}
             try:
+                st.query_params.clear()
                 st.query_params["mode"] = "guest"
-                if "uid" in st.query_params:
-                    del st.query_params["uid"]
             except Exception:
                 pass
             reload_user_session_data()
